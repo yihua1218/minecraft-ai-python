@@ -256,7 +256,9 @@ Here's a minimal example of `profiles/max.json`:
         "unstuck": true,
         "cowardice": false,
         "self_defense": true,
-        "cheat": false
+        "auto_shield": true,
+        "cheat": false,
+        "high_jump": true
     },
     "cerebellum": {
         "narrate_behavior": false
@@ -307,7 +309,9 @@ The bot has a reactive behavioral modes system that responds immediately to urge
         "unstuck": true,
         "cowardice": false,
         "self_defense": true,
-        "cheat": false
+        "auto_shield": true,
+        "cheat": false,
+        "high_jump": true
     }
 }
 ```
@@ -320,11 +324,67 @@ The bot has a reactive behavioral modes system that responds immediately to urge
 | `unstuck` | ON | Get unstuck when blocked for too long |
 | `cowardice` | OFF | Run away from enemies (alternative to self_defense) |
 | `self_defense` | ON | Attack nearby hostile enemies |
+| `auto_shield` | OFF | Automatically raise shield to deflect incoming projectiles |
 | `cheat` | OFF | Use cheats for instant block placement |
+| `high_jump` | ON | Use water bucket clutch to survive high falls |
 
 - **Reactive**: Modes run every tick (~1 second) for immediate response to urgent situations
 - **Interruptible**: Modes like `self_preservation` and `self_defense` can interrupt any ongoing action
 - **Web Monitor**: Mode states are displayed and can be toggled in real-time through the web interface
+
+#### Auto Shield
+
+The `auto_shield` mode enables the bot to automatically detect incoming projectiles (arrows, tridents, fireballs, etc.) and raise a shield to deflect them. Like `high_jump`, it runs in the cerebellum's physicsTick handler (~50ms) for fast response time.
+
+**How it works:**
+1. Every physics tick, scans for incoming projectile entities within detection range
+2. When a projectile is detected heading toward the bot:
+   - Equips a shield to the off-hand (if not already equipped)
+   - Raises the shield by activating the off-hand item
+   - Tracks the projectile and faces toward the threat
+3. After the threat passes or is deflected, lowers the shield with a brief wind-down period
+
+**Configuration:**
+```json
+{
+    "modes": {
+        "auto_shield": true
+    }
+}
+```
+
+**Requirements:**
+- Bot must have a `shield` in inventory
+- Mode must be ON (default: OFF)
+
+#### Water Bucket Clutch (high_jump)
+
+The `high_jump` mode enables the bot to automatically survive dangerous falls using the water bucket clutch technique. It runs in the cerebellum's physicsTick handler (~50ms) for the fast response time the maneuver requires.
+
+**How it works:**
+1. Every physics tick, checks if the bot is falling (`velocity.y < -0.5`)
+2. Scans downward to find the first solid block below
+3. Skips the clutch if already in water, on a ladder/vine/scaffolding, in creative mode, or landing on safe blocks (slime, hay bale, water, etc.)
+4. When within 3-6 blocks of the ground (scaled by velocity) and fall distance > 3 blocks:
+   - Looks straight down
+   - Places water on the ground block
+5. After landing safely, picks up the water with the empty bucket
+
+**Nether support:**
+- In the Nether, water evaporates. The bot automatically uses a `powder_snow_bucket` instead, falling back to a regular water bucket if unavailable.
+
+**Configuration:**
+```json
+{
+    "modes": {
+        "high_jump": true
+    }
+}
+```
+
+**Requirements:**
+- Bot must have a `water_bucket` in inventory (or `powder_snow_bucket` for Nether)
+- Mode must be ON (default: ON)
 
 ### Cerebellum (Reflex System)
 
