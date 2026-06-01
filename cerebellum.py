@@ -74,6 +74,11 @@ class Cerebellum:
         if self.modes_config.get('high_jump', True):
             self._setup_js_fall_clutch()
 
+        # Auto-shield (projectile deflection)
+        # Runs entirely in JavaScript for fast projectile detection and response.
+        if self.modes_config.get('auto_shield', False):
+            self._setup_js_auto_shield()
+
     def _build_reflex_rules(self) -> List[ReflexRule]:
         """Build all reflex rules from mode configurations."""
         rules = []
@@ -723,6 +728,372 @@ function(bot, logFn, Vec3) {
         except Exception as e:
             add_log(
                 title=self.agent.pack_message("[Clutch] Failed to load JS handler"),
+                content=f"Exception: {e}",
+                label="error"
+            )
+
+    # --- Auto-Shield (Projectile Deflection) ---
+
+    _AUTO_SHIELD_JS = r'''
+function(bot, logFn, Vec3) {
+    var PROJECTILE_NAMES = [
+        'arrow', 'spectral_arrow', 'trident',
+        'fireball', 'small_fireball', 'dragon_fireball',
+        'wither_skull', 'llama_spit', 'shulker_bullet',
+        'wind_charge', 'potion'
+    ];
+
+    var RANGED_MOB_NAMES = [
+        'skeleton', 'stray', 'bogged', 'pillager',
+        'blaze', 'ghast', 'breeze', 'drowned'
+    ];
+
+    var DETECTION_RANGE = 15;
+    var MOB_RANGE = 16;
+    var SHIELD_HOLD_MS = 3000;
+
+    var WIND_DOWN_MS = 2000;
+
+    var st = {
+        shieldUp: false,
+        lastProjectile: 0,
+        equipping: false,
+        disabled: false,
+        trackedProj: null,
+        preEquipped: false,
+        lastLookYaw: null,
+        lastLookPitch: null,
+        lastSentYaw: null,
+        lastSentPitch: null,
+        loweredAt: 0
+    };
+
+    function log(msg) { try { logFn(msg); } catch(e) {} }
+
+    function findShield() {
+        var items = bot.inventory.items();
+        for (var i = 0; i < items.length; i++) {
+            if (items[i] && items[i].name === 'shield') return items[i];
+        }
+        return null;
+    }
+
+    function getOffhand() {
+        return bot.inventory.slots[45] || null;
+    }
+
+    function shieldInOffhand() {
+        var oh = bot.inventory.slots[45];
+        return oh && oh.name === 'shield';
+    }
+
+    function detectIncoming() {
+        var bp = bot.entity.position;
+        var nearest = null;
+        var nearestDist = Infinity;
+
+        var ids = Object.keys(bot.entities);
+        for (var i = 0; i < ids.length; i++) {
+            var e = bot.entities[ids[i]];
+            if (!e || !e.name || !e.position || !e.velocity) continue;
+
+            var name = e.name.toLowerCase();
+            var isProj = false;
+            for (var j = 0; j < PROJECTILE_NAMES.length; j++) {
+                if (name === PROJECTILE_NAMES[j] || name.indexOf(PROJECTILE_NAMES[j]) >= 0) {
+                    isProj = true;
+                    break;
+                }
+            }
+            if (!isProj) continue;
+
+            var dist = bp.distanceTo(e.position);
+            if (dist > DETECTION_RANGE) continue;
+
+            var dx = bp.x - e.position.x;
+            var dy = bp.y - e.position.y;
+            var dz = bp.z - e.position.z;
+            var d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+            var vel = e.velocity;
+            var speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
+            if (speed < 0.1 || d < 0.01) continue;
+
+            var dot = (vel.x * dx + vel.y * dy + vel.z * dz) / (speed * d);
+            if (dot < 0.3) continue;
+
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearest = e;
+            }
+        }
+        return nearest;
+    }
+
+    function detectRangedMob() {
+        var bp = bot.entity.position;
+        var ids = Object.keys(bot.entities);
+        for (var i = 0; i < ids.length; i++) {
+            var e = bot.entities[ids[i]];
+            if (!e || !e.name || !e.position) continue;
+            var name = e.name.toLowerCase();
+            for (var j = 0; j < RANGED_MOB_NAMES.length; j++) {
+                if (name.indexOf(RANGED_MOB_NAMES[j]) >= 0) {
+                    if (bp.distanceTo(e.position) < MOB_RANGE) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    function sendSwapPacket() {
+        bot._client.write('block_dig', {
+            status: 6,
+            location: new Vec3(0, 0, 0),
+            face: 0,
+            sequence: 0
+        });
+    }
+
+    // Face toward an incoming projectile using velocity-based pitch.
+    // Yaw comes from horizontal position (stable tracking),
+    // Pitch comes from velocity direction (accurate approach angle for arcs).
+    // This handles high-angle arrows that are above the bot but diving steeply.
+    // Face toward an incoming projectile and record the look direction
+    // so it can be held even after the projectile despawns.
+    function faceProjectile(proj) {
+        bot.lookAt(proj.position, true);
+        st.lastLookYaw = bot.entity.yaw;
+        st.lastLookPitch = bot.entity.pitch;
+    }
+
+    // Face toward the nearest ranged mob (keeps shield aimed at the threat
+    // when no projectile is in flight).
+    function faceNearestRangedMob() {
+        var bp = bot.entity.position;
+        var nearest = null;
+        var nearestDist = Infinity;
+
+        var ids = Object.keys(bot.entities);
+        for (var i = 0; i < ids.length; i++) {
+            var e = bot.entities[ids[i]];
+            if (!e || !e.name || !e.position) continue;
+            var name = e.name.toLowerCase();
+            for (var j = 0; j < RANGED_MOB_NAMES.length; j++) {
+                if (name.indexOf(RANGED_MOB_NAMES[j]) >= 0) {
+                    var dist = bp.distanceTo(e.position);
+                    if (dist < MOB_RANGE && dist < nearestDist) {
+                        nearestDist = dist;
+                        nearest = e;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (nearest) {
+            bot.lookAt(nearest.position.offset(0, 0.85, 0), true);
+            st.lastLookYaw = bot.entity.yaw;
+            st.lastLookPitch = bot.entity.pitch;
+        } else if (st.lastLookYaw !== null) {
+            // No mob visible — hold last known direction
+            bot.look(st.lastLookYaw, st.lastLookPitch, true);
+        }
+    }
+
+    // Equip shield directly to off-hand. Main hand item stays in place.
+    // Much simpler and more reliable than the equip→swap→restore sequence.
+    function equipShieldToOffhand() {
+        var shield = findShield();
+        if (!shield) { st.disabled = true; return; }
+        if (shieldInOffhand()) { st.preEquipped = true; return; }
+
+        log('[Shield] Equipping shield to off-hand');
+        bot.equip(shield, 'off-hand').then(function() {
+            st.preEquipped = true;
+            log('[Shield] Shield now in off-hand');
+        }).catch(function(err) {
+            log('[Shield] Off-hand equip failed: ' + err);
+        });
+    }
+
+    function sendUseItem() {
+        bot._client.write('use_item', {
+            hand: 1,  // off-hand
+            sequence: 0,
+            rotation: {
+                x: -(bot.entity.yaw * 180 / Math.PI),
+                y: -(bot.entity.pitch * 180 / Math.PI)
+            }
+        });
+    }
+
+    // Re-send use_item with updated rotation when facing direction changes.
+    // The server only knows our shield direction from the last use_item packet,
+    // so we must refresh it when tracking a new threat from a different angle.
+    function refreshShieldRotation() {
+        if (!st.shieldUp) return;
+        var curYaw = bot.entity.yaw;
+        var curPitch = bot.entity.pitch;
+        // Check if direction changed significantly (>15 degrees)
+        var dy = Math.abs(curYaw - (st.lastSentYaw || curYaw));
+        var dp = Math.abs(curPitch - (st.lastSentPitch || curPitch));
+        // Normalize yaw delta to [-PI, PI]
+        if (dy > Math.PI) dy = 2 * Math.PI - dy;
+        if (dy > 0.26 || dp > 0.26) {  // ~15 degrees
+            sendUseItem();
+            st.lastSentYaw = curYaw;
+            st.lastSentPitch = curPitch;
+        }
+    }
+
+    function raiseShield() {
+        if (st.shieldUp) return;
+        st.shieldUp = true;
+        bot.usingHeldItem = true;
+        bot._shieldActive = true;
+        if (st.trackedProj && st.trackedProj.position) {
+            faceProjectile(st.trackedProj);
+        }
+        // Send use_item directly with actual look rotation.
+        // bot.activateItem(true) hardcodes rotation {x:0,y:0} which tells
+        // the server the shield faces yaw=0, pitch=0 — wrong direction.
+        sendUseItem();
+        st.lastSentYaw = bot.entity.yaw;
+        st.lastSentPitch = bot.entity.pitch;
+        log('[Shield] Raised (yaw=' + (-(bot.entity.yaw * 180 / Math.PI)).toFixed(0) + ', pitch=' + (-(bot.entity.pitch * 180 / Math.PI)).toFixed(0) + ')');
+    }
+
+    function lowerShield() {
+        if (!st.shieldUp) return;
+        st.shieldUp = false;
+        bot.usingHeldItem = false;
+        bot._shieldActive = false;
+        st.trackedProj = null;
+        st.loweredAt = Date.now();
+        st.lastSentYaw = null;
+        st.lastSentPitch = null;
+        // Keep lastLookYaw/Pitch so the wind-down holds the combat direction
+        // Send RELEASE_USE_ITEM directly (status 5)
+        bot._client.write('block_dig', {
+            status: 5,
+            location: new Vec3(0, 0, 0),
+            face: 0,
+            sequence: 0
+        });
+        log('[Shield] Lowered');
+    }
+
+    bot.on('physicsTick', function() {
+        if (!bot.entity) return;
+
+        if (st.disabled && findShield()) {
+            st.disabled = false;
+        }
+
+        var proj = detectIncoming();
+
+        if (proj) {
+            st.lastProjectile = Date.now();
+            st.trackedProj = proj;
+            faceProjectile(proj);
+
+            if (!st.shieldUp && !st.equipping && !st.disabled) {
+                if (shieldInOffhand()) {
+                    // Shield already in off-hand — raise instantly
+                    raiseShield();
+                } else {
+                    log('[Shield] Incoming projectile, emergency equip!');
+                    // Equip shield directly to off-hand, then raise after a short delay
+                    // to let the server process the inventory change.
+                    var shield = findShield();
+                    if (shield) {
+                        st.equipping = true;
+                        bot._shieldActive = true;
+                        bot.equip(shield, 'off-hand').then(function() {
+                            st.preEquipped = true;
+                            setTimeout(function() {
+                                st.equipping = false;
+                                raiseShield();
+                            }, 150);
+                        }).catch(function(err) {
+                            log('[Shield] Emergency equip failed: ' + err);
+                            st.equipping = false;
+                            bot._shieldActive = false;
+                        });
+                    }
+                }
+            } else if (st.shieldUp) {
+                // Shield already raised, new projectile from different direction —
+                // refresh the use_item packet so the server knows our new facing
+                refreshShieldRotation();
+            }
+        } else if (st.shieldUp) {
+            // Keep facing the threat while shield is raised
+            var tracked = st.trackedProj && bot.entities[st.trackedProj.id];
+            if (tracked && tracked.position && tracked.velocity) {
+                // Still tracking the projectile — update direction
+                faceProjectile(tracked);
+                refreshShieldRotation();
+            } else {
+                // Projectile gone (hit or despawned) — face the shooter instead
+                faceNearestRangedMob();
+                refreshShieldRotation();
+            }
+            // Only lower shield when no projectile AND no ranged mob nearby
+            var hasRangedMob = detectRangedMob();
+            if (!hasRangedMob && Date.now() - st.lastProjectile > SHIELD_HOLD_MS) {
+                lowerShield();
+            }
+        } else if (st.lastLookYaw !== null && Date.now() - st.loweredAt < WIND_DOWN_MS) {
+            // Wind-down: hold combat look direction briefly after shield lowered
+            // so the bot doesn't snap back to its pre-combat heading
+            bot.look(st.lastLookYaw, st.lastLookPitch, true);
+        } else if (!st.preEquipped && !st.equipping && !st.disabled) {
+            // No projectile incoming, but check for ranged mobs to pre-equip
+            if (detectRangedMob()) {
+                if (findShield()) {
+                    equipShieldToOffhand();
+                }
+            }
+        }
+    });
+}
+'''
+
+    def _setup_js_auto_shield(self):
+        """Initialize the JavaScript auto-shield handler.
+
+        Monitors for incoming projectile entities every physicsTick (~50ms).
+        When detected, equips shield to off-hand using the F-key swap sequence:
+        1. Equip shield to main hand
+        2. Swap hands (block_dig status=6)
+        3. Restore original main hand item
+        Then activates the shield via activateItem(offHand=true).
+
+        Runs entirely in JS for fast response and proper async equip chaining.
+        """
+        from javascript import require
+
+        def log_callback(message):
+            add_log(
+                title=self.agent.pack_message(message),
+                label="action"
+            )
+
+        try:
+            vm = require('vm')
+            vec3 = require('vec3').Vec3
+            setup_fn = vm.runInThisContext('(' + self._AUTO_SHIELD_JS + ')')
+            setup_fn(self.agent.bot, log_callback, vec3)
+
+            add_log(
+                title=self.agent.pack_message("[Shield] JS auto-shield handler registered"),
+                label="success"
+            )
+        except Exception as e:
+            add_log(
+                title=self.agent.pack_message("[Shield] Failed to load JS handler"),
                 content=f"Exception: {e}",
                 label="error"
             )

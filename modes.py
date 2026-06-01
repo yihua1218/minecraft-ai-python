@@ -230,7 +230,10 @@ async def _update_self_defense(agent, mode):
     if nearest_hostile:
         say(agent, f"Fighting {nearest_hostile.name}!")
         async def defend():
-            equip_highest_attack(agent)
+            # Don't swap weapons when shield is actively blocking — let the
+            # auto_shield cerebellum handler manage equipment instead.
+            if not getattr(agent.bot, '_shieldActive', False):
+                equip_highest_attack(agent)
             agent.bot.lookAt(nearest_hostile.position)
             agent.bot.attack(nearest_hostile)
         await execute(mode, agent, defend)
@@ -243,6 +246,11 @@ def _update_cheat(agent, mode):
 
 def _update_high_jump(agent, mode):
     """Water bucket clutch - handled by cerebellum physicsTick for fast response."""
+    pass
+
+
+async def _update_auto_shield(agent, mode):
+    """Shield deflection - handled by cerebellum JS handler for fast response."""
     pass
 
 
@@ -302,6 +310,15 @@ MODES_LIST = [
         'active': False,
         'paused': False,
         'update': _update_high_jump,
+    },
+    {
+        'name': 'auto_shield',
+        'description': 'Detect incoming projectiles and raise shield to deflect. Handled by cerebellum physicsTick for fast response.',
+        'interrupts': [],
+        'on': False,
+        'active': False,
+        'paused': False,
+        'update': _update_auto_shield,
     },
 ]
 
