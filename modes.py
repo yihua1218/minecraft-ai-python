@@ -87,10 +87,41 @@ async def _update_self_preservation(agent, mode):
     # Fall blocks
     fall_blocks = ['sand', 'gravel', 'concrete_powder']
 
-    # In water - jump to surface
-    if block_above.name in ['water', 'flowing_water']:
-        if not bot.pathfinder.goal:
+    # In water - actively swim upward and bias toward a nearby shore.
+    if block.name in ['water', 'flowing_water'] or block_above.name in ['water', 'flowing_water']:
+        try:
             bot.setControlState('jump', True)
+            bot.setControlState('sprint', True)
+            bot.setControlState('forward', True)
+        except Exception:
+            pass
+        try:
+            pos = bot.entity.position
+            best = None
+            best_dist = 999
+            for dx in range(-5, 6):
+                for dz in range(-5, 6):
+                    if dx == 0 and dz == 0:
+                        continue
+                    feet = bot.blockAt(pos.offset(dx, 0, dz))
+                    head = bot.blockAt(pos.offset(dx, 1, dz))
+                    ground = bot.blockAt(pos.offset(dx, -1, dz))
+                    if feet is None or head is None or ground is None:
+                        continue
+                    if feet.name in ['water', 'flowing_water', 'lava', 'flowing_lava']:
+                        continue
+                    if head.name not in ['air', 'cave_air', 'void_air', 'short_grass', 'grass']:
+                        continue
+                    if ground.name in ['air', 'cave_air', 'void_air', 'water', 'flowing_water', 'lava', 'flowing_lava']:
+                        continue
+                    dist = abs(dx) + abs(dz)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best = pos.offset(dx, 0, dz)
+            if best is not None:
+                bot.lookAt(best.offset(0.5, 0.2, 0.5))
+        except Exception:
+            pass
         return
 
     # Falling blocks above

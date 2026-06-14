@@ -494,6 +494,61 @@ def enhance_prompt(prompt, benchmark_url, task_description, agent=None):
     return prompt
 
 
+
+def _context_section(context, titles):
+    if context is None:
+        return ""
+    parts = []
+    wanted = {title.lower() for title in titles}
+    for title, content in context:
+        if str(title).lower() in wanted:
+            parts.append(str(content))
+    return "\n".join(parts)
+
+
+def route_llm_config(config, prompt, context=None, agent=None):
+    """Return a routed LLM config.
+
+    Default behavior keeps lightweight decisions on the configured model. Heavier
+    tags and explicit complex user/task messages can opt into complex_model.
+    """
+    routing = config.get("complexity_routing", {})
+    if not routing.get("enabled", False):
+        return config
+
+    complex_model = routing.get("complex_model") or config.get("complex_model")
+    if not complex_model:
+        return config
+
+    tag = config.get("_tag")
+    complex_tags = set(routing.get("complex_tags", ["memory", "reflection", "new_action"]))
+    reason = None
+
+    if tag in complex_tags:
+        reason = "tag:%s" % tag
+    elif tag == "decide":
+        decision_text = _context_section(context, routing.get("decide_context_titles", ["Latest Messages", "Active Goal"]))
+        lowered = decision_text.lower()
+        for keyword in routing.get("complex_keywords", []):
+            if str(keyword).lower() in lowered:
+                reason = "keyword:%s" % keyword
+                break
+
+    if reason is None:
+        return config
+
+    routed = dict(config)
+    routed["model"] = complex_model
+    if agent is not None:
+        add_log(
+            title=agent.pack_message("LLM model routed."),
+            content="tag=%s, model=%s, reason=%s" % (tag, complex_model, reason),
+            label="llm",
+            print=False,
+        )
+    return routed
+
+
 def call_llm_api_with_enhancer(config, prompt, settings, context=None, json_keys=None, examples=None, images=None, max_tokens=4096, temperature=0.9, agent=None):
     """Call LLM API with optional enhancement from benchmark API.
 

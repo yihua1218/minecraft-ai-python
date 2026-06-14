@@ -1,5 +1,5 @@
 
-import sys, math, time, functools, json
+import sys, math, time, functools, json, re, signal, threading, os, subprocess
 import importlib.machinery
 import importlib.util
 from javascript import require, On
@@ -17,6 +17,8 @@ class Agent(object) :
     def __init__(self, configs, settings) :
         add_log(title = "Agent Created.", content = json.dumps(configs, indent = 4), label = "success")
         self.configs, self.settings = configs, settings
+        self.shutdown_event = threading.Event()
+        self.shutdown_reason = None
         global mcdata
         mcdata = minecraft_data(self.settings["minecraft_version"])
         global prismarine_item
@@ -27,6 +29,11 @@ class Agent(object) :
         self.working_process = None
         self._monitor_tick_counter = 0
         self._monitor_state_path = None
+        self._background_loop_started = False
+        self._bridge_process_seen = False
+        self._agent_started_at = time.time()
+        self._last_state_sense_at = 0
+        self._state_sense_interval = float(self.settings.get("state_sense_interval_seconds", 5))
 
         # Request priority queue for handling player messages and self-reflection
         # Priority 1 (HIGH): Player messages - immediate
@@ -62,6 +69,9 @@ class Agent(object) :
         self._goal_resumption_pending = False  # Flag for announcing goal resumption on spawn
         self._load_goal()
         self.bot = mineflayer.createBot(bot_configs)
+        self._install_chat_filter()
+        # Do not monkeypatch bot.chat through JSPyBridge; it turns JS chat into a Python callback and can deadlock.
+        # Chat filtering should happen at explicit call sites instead.
 
         # Load mineflayer plugins with error handling
         try:
@@ -129,8 +139,9 @@ class Agent(object) :
                 # Greet immediately to show successful connection (before slow memory processing)
                 try:
                     greeting = "Hi. I am %s." % self.bot.username
-                    self.bot.chat(greeting)
-                    add_log(title = self.pack_message("Greeting sent"), content = greeting, label = "success")
+                    if not self.configs.get("suppress_startup_chat", False):
+                        self.send_chat(greeting)
+                    add_log(title = self.pack_message("Greeting prepared"), content = greeting, label = "success")
                 except Exception as e:
                     add_log(title = self.pack_message("Failed to send greeting"), content = str(e), label = "error")
 
@@ -141,7 +152,7 @@ class Agent(object) :
                 # Announce goal resumption if we loaded an active goal
                 if self._goal_resumption_pending and self.current_goal:
                     target = self.current_goal.get("target", "a task")
-                    self.bot.chat("I'm resuming: %s" % target)
+                    self.send_chat("I'm resuming: %s" % target)
                     self._goal_resumption_pending = False
 
                 viewer_port = self.configs.get("viewer_port", None)
@@ -161,11 +172,30 @@ class Agent(object) :
                 # Check for pending messages on first spawn only
                 messages = self.memory.get_messages_to_work()
                 if len(messages) > 0 :
-                    self.bot.chat("Found task that is not finished.")
-                    self.bot.emit("decide")
+                    if not self.configs.get("suppress_startup_chat", False):
+                        self.send_chat("Found task that is not finished.")
+                    if not self.configs.get("disable_initial_llm_decide", False):
+                        self._pending_initial_decide = True
+
+                add_log(title=self.pack_message("Spawn initialization complete."), label="agent", print=True)
+                if not self.configs.get("legacy_spawn_event_handlers_enabled", False):
+                    return
+
+            def _spawn_fallback():
+                try:
+                    if not self._initial_spawn_done and getattr(self.bot, "entity", None) is not None:
+                        add_log(title = self.pack_message("Spawn event fallback."), content = "Bot entity exists; running spawn initialization.", label = "warning", print=True)
+                        handle_spawn()
+                except Exception as e:
+                    add_log(title = self.pack_message("Spawn fallback failed."), content = str(e), label = "warning", print=True)
+
+            import threading
+            threading.Timer(3.0, _spawn_fallback).start()
 
             @On(self.bot, 'time')
             def handle_time(*args) :
+                if not self.configs.get("time_event_work_enabled", False):
+                    return
                 # this is triggered for every 20 time ticks
                 # An hour in Mincraft has 10000 time ticks, and it takes 20 mins in real world.
 
@@ -184,6 +214,15 @@ class Agent(object) :
                 if self.bot.modes is not None:
                     self.bot.modes.update()
 
+                # Let enabled plugins run conservative autonomous background loops.
+                for plugin in getattr(self, "plugins", {}).values():
+                    tick = getattr(plugin, "survival_tick", None)
+                    if tick is not None:
+                        try:
+                            tick()
+                        except Exception as e:
+                            add_log(title = self.pack_message("Plugin survival tick failed."), content = str(e), label = "warning")
+
                 # Check if truly idle: no goal, no pending requests, no active work
                 # Use executor.is_busy instead of working_process for new architecture
                 is_truly_idle = (
@@ -201,7 +240,7 @@ class Agent(object) :
                             # Enqueue idle reflection request with Priority 2
                             record = {"type": "idle_reflection", "data": {"sender": self.bot.username, "content": "Idle timer triggered self-reflection"}}
                             self._enqueue_request(priority=2, source="idle_reflection", record=record)
-                            self.bot.emit("decide")
+                            self._request_decide()
                         else :
                             self.self_driven_thinking_timer -= 1
 
@@ -221,7 +260,7 @@ class Agent(object) :
                 # Enqueue MEDIUM priority for self-reflection
                 self._enqueue_request(priority=2, source="reflection", record=record)
                 if self.working_process is None:
-                    self.bot.emit("decide")
+                    self._request_decide()
 
             @On(self.bot, "reflection_check")
             def handle_reflection_check(this, record):
@@ -262,7 +301,10 @@ class Agent(object) :
                             self_driven_thinking(self)
                         return
 
-                self.memory.summarize()
+                if not self.configs.get("skip_decision_memory_summarize", False):
+                    self.memory.summarize()
+                    if self.memory.summarize_thread is not None:
+                        self.memory.summarize_thread.join()
                 self.working_process = get_random_label()
 
                 # Get vision context if enabled
@@ -332,6 +374,48 @@ class Agent(object) :
                     # No valid action, clear working process
                     self.working_process = None
 
+            def _request_decide_direct():
+                try:
+                    handle_decide(None)
+                except Exception as e:
+                    add_log(title = self.pack_message("Direct decide failed."), content = str(e), label = "warning", print=True)
+
+            self._request_decide = lambda: threading.Timer(0.1, _request_decide_direct).start()
+
+            if getattr(self, "_pending_initial_decide", False):
+                self._pending_initial_decide = False
+                threading.Timer(1.0, _request_decide_direct).start()
+
+        def _spawn_watchdog(attempt=1):
+            try:
+                if self.shutdown_event.is_set() or self._initial_spawn_done:
+                    return
+                if getattr(self.bot, "entity", None) is not None:
+                    add_log(
+                        title=self.pack_message("Spawn watchdog fallback."),
+                        content="Bot entity exists but spawn initialization did not run; running it now.",
+                        label="warning",
+                        print=True,
+                    )
+                    handle_spawn()
+                    return
+                max_attempts = int(self.settings.get("spawn_watchdog_attempts", 4))
+                interval = float(self.settings.get("spawn_watchdog_interval_seconds", 10))
+                if attempt >= max_attempts:
+                    add_log(
+                        title=self.pack_message("Spawn watchdog timeout."),
+                        content="No bot entity after %d checks; restarting service to recover." % attempt,
+                        label="error",
+                        print=True,
+                    )
+                    self.request_shutdown("spawn_timeout")
+                    return
+                threading.Timer(interval, lambda: _spawn_watchdog(attempt + 1)).start()
+            except Exception as e:
+                add_log(title=self.pack_message("Spawn watchdog failed."), content=str(e), label="warning", print=True)
+
+        threading.Timer(float(self.settings.get("spawn_watchdog_interval_seconds", 10)), _spawn_watchdog).start()
+
         # Initialize vision system if enabled
         self.vision = None
         vision_config = self.configs.get("vision", {})
@@ -352,9 +436,8 @@ class Agent(object) :
 
         @On(self.bot, "end")
         def handle_end(*args):
-            self.bot.quit()
             add_log(title = self.pack_message("Bot end."), label = "warning")
-
+            self.request_shutdown("bot_end")
         @On(self.bot, "death")
         def handle_death(*args):
             add_log(title = self.pack_message("Bot died!"), content="Health reached 0", label = "error")
@@ -381,6 +464,7 @@ class Agent(object) :
                 except Exception:
                     reason_str = repr(type(reason))
             add_log(title = self.pack_message("Bot kicked!"), content = f"Reason: {reason_str}", label = "error")
+            self.request_shutdown("bot_kicked")
 
         @On(self.bot, "error")
         def handle_error(err, *args):
@@ -457,21 +541,75 @@ class Agent(object) :
             if skin_path is not None : 
                 skin_path = os.path.expanduser(skin_path)
                 if os.path.isfile(skin_path) and self.memory.skin_path != skin_path :
-                    self.bot.chat("/skin set upload %s %s" % (self.configs.get("skin", {}).get("model", "classic"), skin_path))
+                    self.send_chat("/skin set upload %s %s" % (self.configs.get("skin", {}).get("model", "classic"), skin_path), force=True)
                     self.memory.skin_path = skin_path
                     self.memory.save()
                     add_log(title = self.pack_message("Mannual restart is required"), content = "After settting the skin, you need to restart minecraft-ai-python for the AIC to behave as expected.", label = "warning")
 
+
+    def _install_chat_filter(self):
+        """Prepare Python-side chat suppression without replacing the JS bot.chat method."""
+        chat_filter = self.configs.get("chat_filter", {}) or {}
+        suppress_patterns = chat_filter.get("suppress_patterns", []) or []
+        suppress_patterns += self.configs.get("suppress_report_patterns", []) or []
+        self._chat_suppress_regexes = [re.compile(pattern) for pattern in suppress_patterns]
+        self._chat_log_suppressed = chat_filter.get("log_suppressed", True)
+        add_log(
+            title=self.pack_message("Chat filter prepared."),
+            content=json.dumps({"suppress_patterns": suppress_patterns}, indent=4),
+            label="agent",
+            print=True,
+        )
+
+    def should_suppress_chat(self, message):
+        text = str(message)
+        for pattern in getattr(self, "_chat_suppress_regexes", []):
+            if pattern.search(text):
+                if getattr(self, "_chat_log_suppressed", True):
+                    add_log(
+                        title=self.pack_message("Suppressed report chat."),
+                        content=text,
+                        label="agent",
+                        print=False,
+                    )
+                return True
+        return False
+
+    def send_chat(self, message, *args, force=False, **kwargs):
+        if not force and self.should_suppress_chat(message):
+            return None
+        timeout = kwargs.pop("timeout", self.configs.get("chat_timeout_seconds", 45))
+        try:
+            return self.bot.chat(message, *args, timeout=timeout, **kwargs)
+        except Exception as e:
+            add_log(
+                title=self.pack_message("Chat send failed."),
+                content=f"Message: {message}; Exception: {e}",
+                label="warning",
+                print=True,
+            )
+            return None
+
     def _sense_state(self):
         """Update state buffer with current world state."""
         try:
-            from skills import get_entity_position, get_nearest_entities
+            from skills import get_entity_position
 
             pos = get_entity_position(self.bot.entity)
             position = {"x": pos.x, "y": pos.y, "z": pos.z} if pos else {}
 
             # Detect nearby hostiles
-            entities = get_nearest_entities(self, max_distance=16, count=16)
+            modes_config = self.configs.get("modes", {}) or {}
+            detect_hostiles = bool(
+                self.configs.get("state_sensing_hostiles_enabled", False)
+                or modes_config.get("cowardice", False)
+                or modes_config.get("self_defense", False)
+                or modes_config.get("auto_shield", False)
+            )
+            entities = []
+            if detect_hostiles:
+                from skills import get_nearest_entities
+                entities = get_nearest_entities(self, max_distance=16, count=16)
             hostile_types = ['zombie', 'skeleton', 'spider', 'creeper', 'enderman', 'witch', 'slime', 'phantom']
 
             nearby_hostiles = []
@@ -677,7 +815,7 @@ Output a paragraph describing the character's long-term thinking and aspirations
             )
             # Announce to the world
             try:
-                self.bot.chat("I feel like I understand myself better now.")
+                self.send_chat("I feel like I understand myself better now.")
             except Exception:
                 pass
         else:
@@ -1380,7 +1518,7 @@ This is essential because the new_action will result in generating a custom Pyth
             decision = self.decision_history[-1] if self.decision_history else {}
             message_to_send = decision.get("message")
             if message_to_send:
-                self.bot.chat(message_to_send)
+                self.send_chat(message_to_send)
 
             if result is False:
                 action_succeeded = False
@@ -1411,7 +1549,7 @@ This is essential because the new_action will result in generating a custom Pyth
                 # On failure, re-trigger decide so the LLM can re-plan instead of blindly continuing
                 record = {"type": "action_failure", "data": {"sender": self.bot.username, "content": f"Action '{action_name}' failed. Re-evaluate the plan and try a different approach."}}
                 self._enqueue_request(priority=1, source="action_failure", record=record)
-                self.bot.emit("decide")
+                self._request_decide()
             elif self.current_goal and self.current_goal.get("plan"):
                 # Only advance to next step on success
                 plan = self.current_goal.get("plan", [])
@@ -1428,7 +1566,7 @@ This is essential because the new_action will result in generating a custom Pyth
                     # Enqueue plan continuation request and trigger decide
                     record = {"type": "plan_continuation", "data": {"sender": self.bot.username, "content": f"Continuing to step {current_idx + 2}: {plan[current_idx + 1]}"}}
                     self._enqueue_request(priority=2, source="plan_continuation", record=record)
-                    self.bot.emit("decide")
+                    self._request_decide()
 
     def get_mc_time(self) : 
         hrs, mins = 0, 0
@@ -1611,10 +1749,91 @@ This is essential because the new_action will result in generating a custom Pyth
                     if value is not None:
                         config[key] = value
 
+        if tag:
+            config["_tag"] = tag
+
         return config
 
     def pack_message(self, message) :
         return "[Agent \"%s\"] %s" % (self.configs["username"], message)
+
+    def _bridge_process_alive(self):
+        try:
+            result = subprocess.run(
+                ["pgrep", "-P", str(os.getpid()), "-f", "bridge.js"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return result.returncode == 0
+        except Exception:
+            return True
+
+    def start_background_loop(self):
+        if self._background_loop_started:
+            return
+        self._background_loop_started = True
+
+        def _loop():
+            add_log(title=self.pack_message("Background tick loop started."), label="system", print=True)
+            interval = max(1.0, float(getattr(self, "tick_interval_ms", 1000)) / 1000.0)
+            while not self.shutdown_event.is_set():
+                try:
+                    bridge_alive = self._bridge_process_alive()
+                    if bridge_alive:
+                        self._bridge_process_seen = True
+                    elif self._bridge_process_seen or time.time() - self._agent_started_at > 60:
+                        self.request_shutdown("bridge_exit")
+                        break
+
+                    for plugin in getattr(self, "plugins", {}).values():
+                        tick = getattr(plugin, "survival_tick", None)
+                        if tick is not None:
+                            tick()
+
+                    now = time.time()
+                    if now - self._last_state_sense_at >= self._state_sense_interval:
+                        self._last_state_sense_at = now
+                        self._sense_state()
+                        self.cerebellum.tick(can_interrupt=self.cerebellum_interrupt)
+                        if self.bot.modes is not None:
+                            self.bot.modes.update()
+
+                    if not self.executor.is_busy and self.executor.has_pending():
+                        self.executor.execute_next()
+                except Exception as e:
+                    add_log(title=self.pack_message("Background tick failed."), content=str(e), label="warning", print=True)
+                self.shutdown_event.wait(interval)
+            add_log(title=self.pack_message("Background tick loop stopped."), label="system", print=True)
+
+        threading.Thread(target=_loop, name="pybot-background-tick", daemon=True).start()
+
+    def request_shutdown(self, reason):
+        if self.shutdown_event.is_set():
+            return
+        self.shutdown_reason = reason
+        add_log(title=self.pack_message("Shutdown requested."), content=str(reason), label="warning", print=True)
+        self.shutdown_event.set()
+
+    def stop(self, signum=None, frame=None):
+        self.request_shutdown("signal_%s" % signum if signum is not None else "stop")
+        try:
+            self.bot.quit("agent shutdown")
+        except Exception as e:
+            add_log(title=self.pack_message("Bot quit during shutdown failed."), content=str(e), label="warning", print=True)
+
+    def wait_forever(self):
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
+        self.start_background_loop()
+        add_log(title=self.pack_message("Agent main loop started."), label="system", print=True)
+        while not self.shutdown_event.is_set():
+            time.sleep(1)
+        add_log(title=self.pack_message("Agent main loop stopped."), content=str(self.shutdown_reason), label="system", print=True)
+        reason = str(self.shutdown_reason or "")
+        exit_code = 0 if reason == "stop" or reason.startswith("signal_") else 1
+        time.sleep(0.2)
+        os._exit(exit_code)
 
     def _process_chat_message(self, username, message):
         """Process a chat message from a player."""
@@ -1635,7 +1854,7 @@ This is essential because the new_action will result in generating a custom Pyth
         if username is not None and all([not message.startswith(msg) for msg in ignore_messages + self.settings.get("ignore_messages", [])]):
             if username == self.bot.username:
                 record = {"type": "report", "data": {"sender": username, "content": message}}
-            elif (sizeof(self.bot.players) == 2 or "@%s" % self.bot.username in message or "@all" in message or "@All" in message or "@ALL" in message) and all(not message.startswith(msg) for msg in status_messages):
+            elif (username in set(self.configs.get("chat_reply_usernames", [])) or sizeof(self.bot.players) == 2 or "@%s" % self.bot.username in message or "@all" in message or "@All" in message or "@ALL" in message) and all(not message.startswith(msg) for msg in status_messages):
                 if "@admin reset working process" in message:
                     self.working_process = None
                     add_log(title=self.pack_message("Working process reset."), label="warning")
@@ -1664,7 +1883,7 @@ This is essential because the new_action will result in generating a custom Pyth
                 pass
             # Enqueue HIGH priority for player messages
             self._enqueue_request(priority=1, source="player", record=record)
-            self.bot.emit("decide")
+            self._request_decide()
 
 
 if __name__ == "__main__" : 
@@ -1677,4 +1896,5 @@ if __name__ == "__main__" :
             datefmt = '%H:%M:%S',
             level = logging.DEBUG, 
     )
-    Agent(configs, settings)
+    agent = Agent(configs, settings)
+    agent.wait_forever()

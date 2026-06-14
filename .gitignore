@@ -14,9 +14,15 @@ skins/*
 logs/*
 bots/*
 model.json
+settings.json
 .fslckout
 run.sh
 history/*
+local-profiles/*
+plugins/*/save.json
+*.bak
+*.bak-*
+*.bak.*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -79,6 +79,11 @@ class Cerebellum:
         if self.modes_config.get('auto_shield', False):
             self._setup_js_auto_shield()
 
+        # Swim safety (drowning prevention)
+        # Runs in JavaScript on physics ticks so the bot starts swimming immediately.
+        if self.modes_config.get('self_preservation', True):
+            self._setup_js_swim_safety()
+
     def _build_reflex_rules(self) -> List[ReflexRule]:
         """Build all reflex rules from mode configurations."""
         rules = []
@@ -104,10 +109,10 @@ class Cerebellum:
                 ),
                 ReflexRule(
                     name="surface_water",
-                    condition=lambda s: s.is_in_water and s.health < 20,
+                    condition=lambda s: self._should_surface_water(s),
                     action_generator=lambda: self._create_surface_action(),
                     reflex_type=ReflexType.EMERGENCY,
-                    cooldown_ms=200,
+                    cooldown_ms=1500,
                     interrupts=['all']
                 ),
             ])
@@ -171,6 +176,131 @@ class Cerebellum:
             params={"agent": self.agent, "x": pos["x"], "y": pos["y"] + 5, "z": pos["z"], "closeness": 1},
             source=ActionSource.CEREBELLUM_REFLEX
         )
+
+    def _should_surface_water(self, state) -> bool:
+        if state.block_above in ['water', 'flowing_water']:
+            return True
+        if not state.is_in_water:
+            return False
+        current = getattr(state, 'current_action', None)
+        action_name = current.name if current is not None else ""
+        if action_name in ["build_resource_path", "prepare_farm_plot", "build_cliff_path", "escape_stuck"]:
+            return False
+        return state.block_at_feet in ['water', 'flowing_water']
+
+    # --- Swim Safety (Drowning Prevention) ---
+
+    _SWIM_SAFETY_JS = r'''
+    function(bot, logFn, Vec3) {
+        var st = { swimming: false, lastLog: 0 };
+
+        function isWater(block) {
+            return block && (block.name === 'water' || block.name === 'flowing_water');
+        }
+        function isAirLike(block) {
+            return !block || block.name === 'air' || block.name === 'cave_air' || block.name === 'void_air' ||
+                block.name === 'short_grass' || block.name === 'grass' || block.name === 'fern';
+        }
+        function isHazard(block) {
+            return block && (block.name === 'lava' || block.name === 'flowing_lava' || block.name === 'fire' ||
+                block.name === 'magma_block' || block.name === 'cactus' || block.name === 'sweet_berry_bush');
+        }
+        function shouldSwim() {
+            if (!bot.entity || !bot.entity.position) return false;
+            var p = bot.entity.position;
+            var feet = bot.blockAt(new Vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z)));
+            var head = bot.blockAt(new Vec3(Math.floor(p.x), Math.floor(p.y + 1), Math.floor(p.z)));
+            var below = bot.blockAt(new Vec3(Math.floor(p.x), Math.floor(p.y - 0.2), Math.floor(p.z)));
+            var ground = bot.blockAt(new Vec3(Math.floor(p.x), Math.floor(p.y - 1), Math.floor(p.z)));
+            if (isWater(head)) return true;
+            if (typeof bot.oxygenLevel === 'number' && bot.oxygenLevel > 0 && bot.oxygenLevel < 260) return true;
+            if (!isWater(feet) && !isWater(below)) return false;
+            if (ground && !isAirLike(ground) && !isWater(ground) && !isHazard(ground)) return false;
+            return true;
+        }
+        function findShore() {
+            var p = bot.entity.position;
+            var best = null;
+            var bestScore = 999999;
+            for (var dx = -7; dx <= 7; dx++) {
+                for (var dz = -7; dz <= 7; dz++) {
+                    if (dx === 0 && dz === 0) continue;
+                    for (var dy = -2; dy <= 2; dy++) {
+                        var x = Math.floor(p.x + dx);
+                        var y = Math.floor(p.y + dy);
+                        var z = Math.floor(p.z + dz);
+                        var feet = bot.blockAt(new Vec3(x, y, z));
+                        var head = bot.blockAt(new Vec3(x, y + 1, z));
+                        var ground = bot.blockAt(new Vec3(x, y - 1, z));
+                        if (!feet || !head || !ground) continue;
+                        if (isWater(feet) || isHazard(feet) || isHazard(ground)) continue;
+                        if (!isAirLike(feet) || !isAirLike(head)) continue;
+                        if (isAirLike(ground) || isWater(ground)) continue;
+                        var score = Math.abs(dx) + Math.abs(dz) + Math.abs(dy) * 3;
+                        if (score < bestScore) {
+                            bestScore = score;
+                            best = new Vec3(x + 0.5, y + 0.3, z + 0.5);
+                        }
+                    }
+                }
+            }
+            return best;
+        }
+        function releaseSwimControls() {
+            bot.setControlState('jump', false);
+            bot.setControlState('sprint', false);
+            bot.setControlState('forward', false);
+        }
+        bot.on('physicsTick', function() {
+            if (!bot.entity || !bot.entity.position) return;
+            if (!shouldSwim()) {
+                if (st.swimming) {
+                    releaseSwimControls();
+                    st.swimming = false;
+                }
+                return;
+            }
+            st.swimming = true;
+            bot.setControlState('jump', true);
+            bot.setControlState('sprint', true);
+            bot.setControlState('forward', true);
+            var shore = findShore();
+            if (shore) {
+                try { bot.lookAt(shore, true); } catch(e) {}
+            } else {
+                try {
+                    var yaw = bot.entity.yaw || 0;
+                    bot.look(yaw, -0.35, true);
+                } catch(e) {}
+            }
+            var now = Date.now();
+            if (now - st.lastLog > 5000) {
+                st.lastLog = now;
+                try { logFn('[Swim] Active: surfacing and seeking shore'); } catch(e) {}
+            }
+        });
+    }
+    '''
+
+    def _setup_js_swim_safety(self):
+        """Register JS-level swim controls so drowning prevention runs every physics tick."""
+        from javascript import require
+
+        def log_callback(message):
+            add_log(title=self.agent.pack_message(message), label="action", print=False)
+
+        try:
+            vm = require('vm')
+            vec3 = require('vec3').Vec3
+            setup_fn = vm.runInThisContext('(' + self._SWIM_SAFETY_JS + ')')
+            setup_fn(self.agent.bot, log_callback, vec3)
+            add_log(title=self.agent.pack_message("[Swim] JS swim safety handler registered"), label="success")
+        except Exception as e:
+            add_log(
+                title=self.agent.pack_message("[Swim] Failed to load JS swim handler"),
+                content=f"Exception: {e}",
+                label="error"
+            )
 
     def _create_attack_action(self) -> ActionRequest:
         """Create action to attack nearest hostile."""

@@ -204,9 +204,9 @@ def search_block(agent, block_name, range = 64, min_distance = 2) :
                 block = blocks[0]
                 matched_name = block.name
     if block is None :
-        agent.bot.chat("I can't find any %s in %s blocks." % (block_name, math.floor(range)))
+        send_chat(agent, "I can't find any %s in %s blocks." % (block_name, math.floor(range)))
         return False
-    agent.bot.chat("Found %s at %s. I am going there." % (matched_name, block.position))
+    send_chat(agent, "Found %s at %s. I am going there." % (matched_name, block.position))
     go_to_position(agent, block.position.x, block.position.y, block.position.z, min_distance)
     return True
 
@@ -276,41 +276,84 @@ def search_entity(agent, entity_name, range = 64, min_distance = 2) :
                 return dn
         return name
     if entity is None :
-        agent.bot.chat("I can't find any %s in %s blocks." % (_display_name(entity_name), math.floor(range)))
+        send_chat(agent, "I can't find any %s in %s blocks." % (_display_name(entity_name), math.floor(range)))
         return False
     agent_pos = get_entity_position(agent.bot.entity)
     entity_pos = get_entity_position(entity)
     if agent_pos is not None and entity_pos is not None :
         distance = agent_pos.distanceTo(entity_pos)
-        agent.bot.chat("Found %s %s blocks away." % (_display_name(entity.name), math.floor(distance)))
+        send_chat(agent, "Found %s %s blocks away." % (_display_name(entity.name), math.floor(distance)))
         # Only move if not already close enough to attack (10 blocks = within attack range)
         if distance > 10:
-            agent.bot.chat("I am going there.")
+            send_chat(agent, "I am going there.")
             go_to_position(agent, entity_pos.x, entity_pos.y, entity_pos.z, min_distance)
         else:
-            agent.bot.chat("I'm already close enough.")
+            send_chat(agent, "I'm already close enough.")
     else :
-        agent.bot.chat("Some errors here. Let me try again.")
+        send_chat(agent, "Some errors here. Let me try again.")
     return True
+
+def _safe_pathfinder(agent, reason="movement"):
+    try:
+        pf = getattr(agent.bot, "pathfinder", None)
+        if pf is None:
+            add_log(title=agent.pack_message("Pathfinder unavailable."), content=reason, label="warning")
+            return None
+        for attr in ["setMovements", "setGoal", "isMoving"]:
+            if not hasattr(pf, attr):
+                add_log(title=agent.pack_message("Pathfinder incomplete."), content="%s missing %s" % (reason, attr), label="warning")
+                return None
+        return pf
+    except Exception as e:
+        add_log(title=agent.pack_message("Pathfinder check failed."), content="%s: %s" % (reason, e), label="warning")
+        return None
+
+def _safe_movements(agent, allow_dig=False):
+    movements = pathfinder.Movements(agent.bot)
+    try:
+        movements.canDig = bool(allow_dig)
+        movements.canPlaceOn = False
+        movements.allow1by1towers = False
+    except Exception:
+        pass
+    return movements
 
 def go_to_position(agent, x, y, z, closeness = 0) : 
     """Command the agent to move to (x, y, z) position with a target 'closeness' tolerance; call with go_to_position(agent, x, y, z, closeness)."""
     try :
-        agent.bot.pathfinder.setMovements(pathfinder.Movements(agent.bot))
-        agent.bot.pathfinder.setGoal(pathfinder.goals.GoalNear(x, y, z, closeness)) 
+        pf = _safe_pathfinder(agent, "go_to_position target (%.1f, %.1f, %.1f)" % (x, y, z))
+        if pf is None:
+            return False
+        pf.setMovements(_safe_movements(agent, allow_dig=False))
+        pf.setGoal(pathfinder.goals.GoalNear(x, y, z, closeness))
         time.sleep(0.1)
-        while agent.bot.pathfinder.isMoving() :
+        deadline = time.time() + float(agent.configs.get("movement_timeout_seconds", 20))
+        while pf.isMoving() :
+            if time.time() > deadline:
+                try:
+                    pf.stop()
+                except Exception:
+                    pass
+                add_log(title = agent.pack_message("Movement timed out."), content = "Target: (%.1f, %.1f, %.1f)" % (x, y, z), label = "warning")
+                return False
             time.sleep(0.2)
-        agent.bot.chat("I have arrived at the position (%.1f, %.1f, %.1f)." % (x, y, z))
+        send_chat(agent, "I have arrived at the position (%.1f, %.1f, %.1f)." % (x, y, z))
+        return True
     except Exception as e : 
         add_log(title = agent.pack_message("Exception in executing go_to_position."), content = "Exception: %s" % e, label = "warning")
+        return False
+
+def send_chat(agent, message, *args, **kwargs):
+    if hasattr(agent, "send_chat"):
+        return agent.send_chat(message, *args, **kwargs)
+    return agent.bot.chat(message, *args, **kwargs)
 
 def chat(agent, player_name, message) : 
     """Send a 'message' from the agent to a specified 'player_name' in the game chat; call with chat(agent, player_name, message)."""
     if player_name == "all" or (player_name != agent.bot.username and agent.bot.players[player_name] is not None) : 
         if not message.strip().startswith("@%s" % player_name) : 
             message = "@%s %s" % (player_name, message)
-    agent.bot.chat(message)
+    send_chat(agent, message)
 
 def go_to_player(agent, player_name, closeness = 1) :
     """Move the agent to the specified player within a 'closeness' distance; call with go_to_player(agent, player_name, closeness)."""
@@ -352,21 +395,21 @@ def interact_with_block(agent, block_name=None, x=None, y=None, z=None) :
     elif block_name is not None :
         result = get_nearest_block(agent, block_name, 16)
         if result is None :
-            agent.bot.chat("I can't find any %s nearby." % block_name)
+            send_chat(agent, "I can't find any %s nearby." % block_name)
             return False
         block_pos = vec3.Vec3(result["position"].x, result["position"].y, result["position"].z)
     else :
-        agent.bot.chat("Please tell me which block to interact with.")
+        send_chat(agent, "Please tell me which block to interact with.")
         return False
 
     go_to_position(agent, block_pos.x, block_pos.y, block_pos.z, 1)
     block = agent.bot.blockAt(block_pos)
     if block is None :
-        agent.bot.chat("There is no block there.")
+        send_chat(agent, "There is no block there.")
         return False
     agent.bot.lookAt(block.position.offset(0.5, 0.5, 0.5))
     agent.bot.activateBlock(block)
-    agent.bot.chat("I interacted with the %s." % block.name)
+    send_chat(agent, "I interacted with the %s." % block.name)
     return True
 
 def use_item_on_block(agent, item_name, block_name=None, x=None, y=None, z=None) :
@@ -380,11 +423,11 @@ def use_item_on_block(agent, item_name, block_name=None, x=None, y=None, z=None)
     elif block_name is not None :
         result = get_nearest_block(agent, block_name, 16)
         if result is None :
-            agent.bot.chat("I can't find any %s nearby." % block_name)
+            send_chat(agent, "I can't find any %s nearby." % block_name)
             return False
         block_pos = vec3.Vec3(result["position"].x, result["position"].y, result["position"].z)
     else :
-        agent.bot.chat("Please tell me which block to target.")
+        send_chat(agent, "Please tell me which block to target.")
         return False
 
     # Equip the item
@@ -395,13 +438,13 @@ def use_item_on_block(agent, item_name, block_name=None, x=None, y=None, z=None)
         agent.bot.equip(item, 'hand')
         time.sleep(0.3)
     else :
-        agent.bot.chat("I don't have any %s to use." % item_name)
+        send_chat(agent, "I don't have any %s to use." % item_name)
         return False
 
     go_to_position(agent, block_pos.x, block_pos.y, block_pos.z, 1)
     block = agent.bot.blockAt(block_pos)
     if block is None :
-        agent.bot.chat("There is no block there.")
+        send_chat(agent, "There is no block there.")
         return False
 
     # Use embedded JS: look at block center (force=true), defer use_item packet
@@ -409,7 +452,7 @@ def use_item_on_block(agent, item_name, block_name=None, x=None, y=None, z=None)
     fn = _get_js_use_item_fn()
     fn(agent.bot, block.position)
     time.sleep(0.5)
-    agent.bot.chat("I used %s on the %s." % (item_name, block.name))
+    send_chat(agent, "I used %s on the %s." % (item_name, block.name))
     return True
 
 def interact_with_entity(agent, entity_name, item_name) :
@@ -417,14 +460,14 @@ def interact_with_entity(agent, entity_name, item_name) :
     Call with interact_with_entity(agent, entity_name, item_name)."""
     entity = get_nearest_entity_where(agent, lambda et : entity_name in et.name, 32)
     if entity is None :
-        agent.bot.chat("I can't find any %s nearby." % entity_name)
+        send_chat(agent, "I can't find any %s nearby." % entity_name)
         return False
 
     item = get_an_item_in_inventory(agent, item_name)
     if item is None :
         item = get_an_item_in_hotbar(agent, item_name)
     if item is None :
-        agent.bot.chat("I don't have any %s to use on the %s." % (item_name, entity_name))
+        send_chat(agent, "I don't have any %s to use on the %s." % (item_name, entity_name))
         return False
 
     agent.bot.equip(item, 'hand')
@@ -432,7 +475,7 @@ def interact_with_entity(agent, entity_name, item_name) :
 
     entity_pos = get_entity_position(entity)
     if entity_pos is None :
-        agent.bot.chat("I can't locate the %s." % entity_name)
+        send_chat(agent, "I can't locate the %s." % entity_name)
         return False
 
     if get_entity_position(agent.bot.entity) is not None and get_entity_position(agent.bot.entity).distanceTo(entity_pos) > 4 :
@@ -440,14 +483,14 @@ def interact_with_entity(agent, entity_name, item_name) :
 
     entity_pos = get_entity_position(entity)
     if entity_pos is None :
-        agent.bot.chat("I lost sight of the %s." % entity_name)
+        send_chat(agent, "I lost sight of the %s." % entity_name)
         return False
 
     agent.bot.lookAt(entity_pos.offset(0, entity.height / 2, 0))
     time.sleep(0.2)
     agent.bot.activateEntity(entity)
 
-    agent.bot.chat("I used %s on the %s." % (item_name, entity_name))
+    send_chat(agent, "I used %s on the %s." % (item_name, entity_name))
     return True
 
 def quit_interaction(agent) :
@@ -455,13 +498,13 @@ def quit_interaction(agent) :
     leave a boat/minecart, stop riding an entity, etc."""
     if agent.bot.isSleeping :
         agent.bot.wake()
-        agent.bot.chat("I got up from the bed.")
+        send_chat(agent, "I got up from the bed.")
     elif agent.bot.vehicle :
         agent.bot.dismount()
-        agent.bot.chat("I dismounted.")
+        send_chat(agent, "I dismounted.")
     else :
         agent.bot.deactivateItem()
-        agent.bot.chat("I stopped interacting.")
+        send_chat(agent, "I stopped interacting.")
     return True
 
 def move_away(agent, distance) :
@@ -478,25 +521,25 @@ def break_block_at(agent, x, y, z) :
     if block is not None and block.name not in get_empty_block_names() and block.name != "water" and block.name != "lava" :
         if agent.bot.modes is not None and agent.bot.modes.isOn("cheat") :
             msg = "/setblock %d %d %d air" % (math.floor(x), math.floor(y), math.floor(z))
-            agent.bot.chat(msg)
+            send_chat(agent, msg)
             return True
         agent_pos = get_entity_position(agent.bot.entity)
         if agent_pos is not None and agent_pos.distanceTo(block.position) > 4.5 :
             pos = block.position
-            movements = pathfinder.Movements(agent.bot)
-            movements.canPlaceOn = False
-            movements.allow1by1towers = False
-            agent.bot.pathfinder.setMovements(movements)
-            agent.bot.pathfinder.setGoal(pathfinder.goals.GoalNear(pos.x, pos.y, pos.z, 4))
+            pf = _safe_pathfinder(agent, "break_block_at approach")
+            if pf is None:
+                return False
+            pf.setMovements(_safe_movements(agent, allow_dig=False))
+            pf.setGoal(pathfinder.goals.GoalNear(pos.x, pos.y, pos.z, 4))
             time.sleep(0.1)
-            while agent.bot.pathfinder.isMoving() :
+            while pf.isMoving() :
                 time.sleep(0.2)
 
         if agent.bot.game is not None and agent.bot.game.gameMode != "creative" :
             agent.bot.tool.equipForBlock(block)
             item_id = agent.bot.heldItem.type if agent.bot.heldItem is not None else None 
             if not block.canHarvest(item_id) :
-                agent.bot.chat("I Don't have right tools to break %s." % block.displayName)
+                send_chat(agent, "I Don't have right tools to break %s." % block.displayName)
                 return False
         agent.bot.dig(block, True, timeout=60)
     else :
@@ -561,7 +604,7 @@ def equip_item(agent, item_name) :
     if item is None :
         item = get_an_item_in_hotbar(agent, item_name)
     if item is None :
-        agent.bot.chat("I don't have any %s to equip." % get_item_display_name(get_item_id(item_name)))
+        send_chat(agent, "I don't have any %s to equip." % get_item_display_name(get_item_id(item_name)))
         return False
 
     if "legging" in item_name :
@@ -577,7 +620,7 @@ def equip_item(agent, item_name) :
     else :
         agent.bot.equip(item, 'hand')
 
-    agent.bot.chat("I am equipped %s." % item_name)
+    send_chat(agent, "I am equipped %s." % item_name)
     return True
 
 def drop_item(agent, item_name, num = 1) :
@@ -594,10 +637,10 @@ def drop_item(agent, item_name, num = 1) :
             break
 
     if dropped < 1 :
-        agent.bot.chat("I don't have any %s to drop." % get_item_display_name(get_item_id(item_name)))
+        send_chat(agent, "I don't have any %s to drop." % get_item_display_name(get_item_id(item_name)))
         return False
 
-    agent.bot.chat("I dropped %d %s." % (dropped, get_item_display_name(get_item_id(item_name))))
+    send_chat(agent, "I dropped %d %s." % (dropped, get_item_display_name(get_item_id(item_name))))
     return True
 
 def fight(agent, entity_name, kill = False) :
@@ -611,7 +654,7 @@ def fight(agent, entity_name, kill = False) :
     if entity is not None :
         return attack_entity(agent, entity, kill)
     else :
-        agent.bot.chat("I can't find any %s to attack." % get_entity_display_name(get_entity_id(entity_name)))
+        send_chat(agent, "I can't find any %s to attack." % get_entity_display_name(get_entity_id(entity_name)))
         return False
 
 def attack_entity(agent, entity, kill = False) :
@@ -634,9 +677,9 @@ def attack_entity(agent, entity, kill = False) :
                 go_to_position(agent, entity_pos.x, entity_pos.y, entity_pos.z)
             agent.bot.attack(entity)
             if is_player:
-                agent.bot.chat("I attacked %s. (Players don't stay dead, so I'll stop here.)" % entity.name)
+                send_chat(agent, "I attacked %s. (Players don't stay dead, so I'll stop here.)" % entity.name)
             else:
-                agent.bot.chat("I attacked %s." % entity.name)
+                send_chat(agent, "I attacked %s." % entity.name)
         else :
             # Kill mode with timeout for mobs
             agent.bot.pvp.attack(entity)
@@ -648,7 +691,7 @@ def attack_entity(agent, entity, kill = False) :
 
                 # Check timeout
                 if elapsed > MAX_ATTACK_DURATION :
-                    agent.bot.chat("I've been fighting %s for too long. Taking a break." % entity.name)
+                    send_chat(agent, "I've been fighting %s for too long. Taking a break." % entity.name)
                     agent.bot.pvp.stop()
                     add_log(
                         title = agent.pack_message("Attack timeout"),
@@ -674,10 +717,10 @@ def attack_entity(agent, entity, kill = False) :
                         print = False
                     )
 
-            agent.bot.chat("I killed %s." % entity.name)
+            send_chat(agent, "I killed %s." % entity.name)
             pickup_nearby_items(agent)
     else :
-        agent.bot.chat("I can't locate the \"%s\"." % entity.name)
+        send_chat(agent, "I can't locate the \"%s\"." % entity.name)
         add_log(title = agent.pack_message("Can't get the entity's position."), label = "action", print = False)
     return False
 
@@ -689,8 +732,11 @@ def pickup_nearby_items(agent, max_distance = 8, num = 8) :
         init_counts = sum([value for value in get_item_counts(agent).values()])
         picked_up = 0
         while nearest_item and picked_up < num :
-            agent.bot.pathfinder.setMovements(pathfinder.Movements(agent.bot))
-            agent.bot.pathfinder.setGoal(pathfinder.goals.GoalFollow(nearest_item, 0.8), False)
+            pf = _safe_pathfinder(agent, "pickup_nearby_items")
+            if pf is None:
+                break
+            pf.setMovements(_safe_movements(agent, allow_dig=False))
+            pf.setGoal(pathfinder.goals.GoalFollow(nearest_item, 0.8), False)
             time.sleep(0.5)
             prev_item = nearest_item
             nearest_item = get_nearest_item(agent, distance = max_distance)
@@ -698,7 +744,7 @@ def pickup_nearby_items(agent, max_distance = 8, num = 8) :
                 break
             counts = sum([value for value in get_item_counts(agent).values()])
             picked_up = counts - init_counts 
-        agent.bot.chat("I picked up %d items" % picked_up)
+        send_chat(agent, "I picked up %d items" % picked_up)
     return True
 
 def equip_highest_attack(agent) :
@@ -720,7 +766,7 @@ def craft(agent, item_name, num = 1) :
     if resolved != item_name :
         item_name = resolved
     if not get_item_crafting_recipes(item_name) or len(get_item_crafting_recipes(item_name)) < 1 :
-        agent.bot.chat("I don't have crafting recipe for %s." % item_name)
+        send_chat(agent, "I don't have crafting recipe for %s." % item_name)
         return False
 
     recipes = agent.bot.recipesFor(get_item_id(item_name), None, 1, None) 
@@ -730,7 +776,7 @@ def craft(agent, item_name, num = 1) :
     if recipes is None or sizeof(recipes) < 1 : 
         recipes = agent.bot.recipesFor(get_item_id(item_name), None, 1, True)
         if recipes is None or sizeof(recipes) < 1 : 
-            agent.bot.chat("I don't have enough resources to craft %s." % item_name)
+            send_chat(agent, "I don't have enough resources to craft %s." % item_name)
             return False
 
         crafting_table = get_nearest_block(agent, 'crafting_table', crafting_table_range)
@@ -745,10 +791,10 @@ def craft(agent, item_name, num = 1) :
                         recipes = agent.bot.recipesFor(get_item_id(item_name), None, 1, crafting_table)
                         placed_table = True
                 else:
-                    agent.bot.chat("There is no space to place the crafting table.")
+                    send_chat(agent, "There is no space to place the crafting table.")
                     return False
             else :
-                agent.bot.chat("I don't have any crafting table.")
+                send_chat(agent, "I don't have any crafting table.")
                 return False
         else :
             recipes = agent.bot.recipesFor(get_item_id(item_name), None, 1, crafting_table)
@@ -769,9 +815,9 @@ def craft(agent, item_name, num = 1) :
     
     agent.bot.craft(recipe, min(craft_limit["num"], num), crafting_table)
     if craft_limit["num"] < num : 
-        agent.bot.chat("I don't have enough %s to craft %s %s, crafted %s." % (craft_limit["limiting_resource"], num, item_name, craft_limit["num"]))
+        send_chat(agent, "I don't have enough %s to craft %s %s, crafted %s." % (craft_limit["limiting_resource"], num, item_name, craft_limit["num"]))
     else :
-        agent.bot.chat("I have crafted %s %s." % (num, item_name))
+        send_chat(agent, "I have crafted %s %s." % (num, item_name))
     if placed_table :
         collect_blocks(agent, 'crafting_table', 1)
 
@@ -782,10 +828,10 @@ def collect_blocks(agent, block_name, num, exclude = None) :
     """Collect 'num' blocks of type 'block_name', excluding blocks in the 'exclude' list; call with collect_blocks(agent, block_name, num, exclude)."""
     if agent.bot.game is not None and agent.bot.game.gameMode == "creative" :
         if agent.bot.modes is not None and agent.bot.modes.isOn("cheat") :
-            agent.bot.chat("/give %s %s" % (agent.bot.username, block_name))
-            agent.bot.chat("This is creative mode and I got %s." % get_display_name_of_block(block_name))
+            send_chat(agent, "/give %s %s" % (agent.bot.username, block_name))
+            send_chat(agent, "This is creative mode and I got %s." % get_display_name_of_block(block_name))
         else :
-            agent.bot.chat("Now we are in creative mode, don't need to collect any blocks.")
+            send_chat(agent, "Now we are in creative mode, don't need to collect any blocks.")
         return 1 
 
     block_names = [block_name]
@@ -808,16 +854,16 @@ def collect_blocks(agent, block_name, num, exclude = None) :
         blocks = list(filter(lambda block: movements.safeToBreak(block), blocks))
         if len(blocks) < 1 : 
             if collected < 1 :  
-                agent.bot.chat("I don't find any %s nearby to collect." % get_display_name_of_block(block_name))
+                send_chat(agent, "I don't find any %s nearby to collect." % get_display_name_of_block(block_name))
             else :
-                agent.bot.chat("Can't find more %s nearby to collect." % get_display_name_of_block(block_name))
+                send_chat(agent, "Can't find more %s nearby to collect." % get_display_name_of_block(block_name))
             break
 
         block = blocks[0]
         agent.bot.tool.equipForBlock(block)
         item_id = agent.bot.heldItem.type if agent.bot.heldItem is not None else None
         if not block.canHarvest(item_id) :
-            agent.bot.chat("I dont't have right tools to harvest %s." % get_display_name_of_block(block_name))
+            send_chat(agent, "I dont't have right tools to harvest %s." % get_display_name_of_block(block_name))
             break
 
         if must_collect_manually(block_name) :
@@ -834,7 +880,7 @@ def collect_blocks(agent, block_name, num, exclude = None) :
         if agent.bot.interrupt_code :
             break;  
 
-    agent.bot.chat("I have collected %d %s." % (collected, get_display_name_of_block(block_name)))
+    send_chat(agent, "I have collected %d %s." % (collected, get_display_name_of_block(block_name)))
     return collected > 0
 
 def should_place_torch(agent) : 
@@ -866,7 +912,7 @@ def auto_light(agent) :
 def place_block(agent, block_name, x, y, z, place_on = 'bottom', dont_cheat = False) :
     """Place a 'block_name' at (x, y, z), optionally aligning with 'place_on' surface; 'dont_cheat' controls whether block must come from inventory; call with place_block(agent, block_name, x, y, z, place_on, dont_cheat)."""
     if get_block_id(block_name) is None and block_name != 'air' :
-        agent.bot.chat("%s is invalid block name." % block_name, print = False)
+        send_chat(agent, "%s is invalid block name." % block_name, print = False)
         return False
 
     target_dest = [math.floor(x), math.floor(y), math.floor(z)]
@@ -907,15 +953,15 @@ def place_block(agent, block_name, x, y, z, place_on = 'bottom', dont_cheat = Fa
             block_name += "[facing=%s]" % face
 
         msg = "/setblock %d %d %d %s" % (math.floor(x), math.floor(y), math.floor(z), block_name)
-        agent.bot.chat(msg)
+        send_chat(agent, msg)
 
         if "door" in block_name :
             msg = "/setblock %d %d %d %s [half=upper]" % (math.floor(x), math.floor(y + 1), math.floor(z), block_name)
-            agent.bot.chat(msg)
+            send_chat(agent, msg)
 
         if "bed" in block_name :
             msg = "/setblock %d %d %d %s [part=head]" % (math.floor(x), math.floor(y), math.floor(z - 1), block_name)
-            agent.bot.chat(msg)
+            send_chat(agent, msg)
 
         return True
     
@@ -970,7 +1016,7 @@ def place_block(agent, block_name, x, y, z, place_on = 'bottom', dont_cheat = Fa
             break
 
     if build_off_block is None : 
-        agent.bot.chat("I Can't place %s at %s. Nothing to place on." % (block_name, target_dest))
+        send_chat(agent, "I Can't place %s at %s. Nothing to place on." % (block_name, target_dest))
         return False
 
     agent_pos = get_entity_position(agent.bot.entity)
@@ -981,10 +1027,13 @@ def place_block(agent, block_name, x, y, z, place_on = 'bottom', dont_cheat = Fa
             # too close
             goal = pathfinder.goals.GoalNear(target_dest[0], target_dest[1], target_dest[2], 2)
             inverted_goal = pathfinder.goals.GoalInvert(goal)
-            agent.bot.pathfinder.setMovements(pathfinder.Movements(agent.bot))
-            agent.bot.pathfinder.setGoal(inverted_goal)
+            pf = _safe_pathfinder(agent, "place_block move away")
+            if pf is None:
+                return False
+            pf.setMovements(_safe_movements(agent, allow_dig=False))
+            pf.setGoal(inverted_goal)
             time.sleep(0.1)
-            while agent.bot.pathfinder.isMoving() :
+            while pf.isMoving() :
                 time.sleep(0.2)
 
     agent_pos = get_entity_position(agent.bot.entity)
@@ -994,14 +1043,14 @@ def place_block(agent, block_name, x, y, z, place_on = 'bottom', dont_cheat = Fa
     agent.bot.equip(block, 'hand')
     agent.bot.lookAt(build_off_block.position)
     agent.bot.placeBlock(build_off_block, vec3.Vec3(*face_vec))
-    agent.bot.chat("I placed %s at %s." % (get_display_name_of_block(block_name), target_dest))
+    send_chat(agent, "I placed %s at %s." % (get_display_name_of_block(block_name), target_dest))
     return True
 
 def consume_item(agent, item_name) :
     """Consume (eat or drink) the specified item from inventory; call with consume_item(agent, item_name)."""
     item = get_an_item_in_inventory(agent, item_name)
     if item is None :
-        agent.bot.chat("I don't have any %s to consume." % get_item_display_name(get_item_id(item_name)))
+        send_chat(agent, "I don't have any %s to consume." % get_item_display_name(get_item_id(item_name)))
         return False
 
     actual_name = item.name
@@ -1018,7 +1067,7 @@ def consume_item(agent, item_name) :
         consumable = True
 
     if not consumable :
-        agent.bot.chat("I can't consume %s -- it's not a food or drinkable." % actual_name)
+        send_chat(agent, "I can't consume %s -- it's not a food or drinkable." % actual_name)
         return False
 
     # Stop any ongoing item use
@@ -1052,23 +1101,23 @@ def consume_item(agent, item_name) :
     # Check if the item was actually consumed (removed from inventory)
     item_after = get_an_item_in_inventory(agent, actual_name)
     if item_after is not None and item_after.count == count_before :
-        agent.bot.chat("I couldn't eat %s -- I'm not hungry right now." % actual_name)
+        send_chat(agent, "I couldn't eat %s -- I'm not hungry right now." % actual_name)
         return False
 
     verb = "drank" if any(k in actual_name for k in drinkable_keywords) else "ate"
-    agent.bot.chat("I %s the %s." % (verb, actual_name))
+    send_chat(agent, "I %s the %s." % (verb, actual_name))
     return True
 
 def feed_animal(agent, entity_name, food_name) :
     """Feed an animal by equipping the correct food, approaching, and using it on the entity; call with feed_animal(agent, entity_name, food_name)."""
     entity = get_nearest_entity_where(agent, lambda et : entity_name in et.name, 32)
     if entity is None :
-        agent.bot.chat("I can't find any %s nearby to feed." % entity_name)
+        send_chat(agent, "I can't find any %s nearby to feed." % entity_name)
         return False
 
     food_item = get_an_item_in_inventory(agent, food_name)
     if food_item is None :
-        agent.bot.chat("I don't have any %s to feed the %s." % (food_name, entity_name))
+        send_chat(agent, "I don't have any %s to feed the %s." % (food_name, entity_name))
         return False
 
     agent.bot.equip(food_item, 'hand')
@@ -1076,7 +1125,7 @@ def feed_animal(agent, entity_name, food_name) :
 
     entity_pos = get_entity_position(entity)
     if entity_pos is None :
-        agent.bot.chat("I can't locate the %s." % entity_name)
+        send_chat(agent, "I can't locate the %s." % entity_name)
         return False
 
     agent_pos = get_entity_position(agent.bot.entity)
@@ -1085,14 +1134,14 @@ def feed_animal(agent, entity_name, food_name) :
 
     entity_pos = get_entity_position(entity)
     if entity_pos is None :
-        agent.bot.chat("I lost sight of the %s." % entity_name)
+        send_chat(agent, "I lost sight of the %s." % entity_name)
         return False
 
     agent.bot.lookAt(entity_pos.offset(0, entity.height / 2, 0))
     time.sleep(0.2)
     agent.bot.activateEntity(entity)
 
-    agent.bot.chat("I fed the %s with %s." % (entity_name, food_name))
+    send_chat(agent, "I fed the %s with %s." % (entity_name, food_name))
     return True
 
 def remember(agent, key, value) :
