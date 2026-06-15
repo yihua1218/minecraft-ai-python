@@ -326,7 +326,7 @@ def _safe_movements(agent, allow_dig=False, allow_place=False):
     movements = pathfinder.Movements(agent.bot)
     try:
         movements.canDig = bool(allow_dig)
-        movements.allow1by1towers = bool(allow_place)
+        movements.allow1by1towers = False
         movements.allowParkour = True
         movements.placeCost = float(agent.configs.get("movement_place_cost", 8))
         if allow_place:
@@ -338,6 +338,17 @@ def _safe_movements(agent, allow_dig=False, allow_place=False):
     except Exception:
         pass
     return movements
+
+def _reset_movement_controls(agent):
+    for control in ["jump", "sneak", "forward", "back", "left", "right", "sprint"]:
+        try:
+            agent.bot.setControlState(control, False)
+        except Exception:
+            pass
+    try:
+        agent.bot.look(agent.bot.entity.yaw, 0, False)
+    except Exception:
+        pass
 
 def _go_to_position_attempt(agent, x, y, z, closeness, allow_place=False):
     pf = _safe_pathfinder(agent, "go_to_position target (%.1f, %.1f, %.1f)" % (x, y, z))
@@ -352,25 +363,28 @@ def _go_to_position_attempt(agent, x, y, z, closeness, allow_place=False):
         return False
     pf.setMovements(_safe_movements(agent, allow_dig=False, allow_place=allow_place))
     pf.setGoal(pathfinder.goals.GoalNear(x, y, z, closeness))
-    time.sleep(0.1)
-    timeout_key = "movement_build_timeout_seconds" if allow_place else "movement_timeout_seconds"
-    default_timeout = 35 if allow_place else 20
-    deadline = time.time() + float(agent.configs.get(timeout_key, default_timeout))
-    while pf.isMoving() :
-        if time.time() > deadline:
-            try:
-                pf.stop()
-            except Exception:
-                pass
-            mode = "with scaffold fallback" if allow_place else "on existing path"
-            add_log(
-                title=agent.pack_message("Movement timed out."),
-                content="Target: (%.1f, %.1f, %.1f), mode: %s" % (x, y, z, mode),
-                label="warning",
-            )
-            return False
-        time.sleep(0.2)
-    return True
+    try:
+        time.sleep(0.1)
+        timeout_key = "movement_build_timeout_seconds" if allow_place else "movement_timeout_seconds"
+        default_timeout = 35 if allow_place else 20
+        deadline = time.time() + float(agent.configs.get(timeout_key, default_timeout))
+        while pf.isMoving() :
+            if time.time() > deadline:
+                try:
+                    pf.stop()
+                except Exception:
+                    pass
+                mode = "with scaffold fallback" if allow_place else "on existing path"
+                add_log(
+                    title=agent.pack_message("Movement timed out."),
+                    content="Target: (%.1f, %.1f, %.1f), mode: %s" % (x, y, z, mode),
+                    label="warning",
+                )
+                return False
+            time.sleep(0.2)
+        return True
+    finally:
+        _reset_movement_controls(agent)
 
 def go_to_position(agent, x, y, z, closeness = 0) : 
     """Command the agent to move to (x, y, z) position with a target 'closeness' tolerance; call with go_to_position(agent, x, y, z, closeness)."""
