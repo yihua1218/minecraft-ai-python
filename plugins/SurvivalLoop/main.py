@@ -75,10 +75,11 @@ class PluginInstance(Plugin):
         if not self.state.get("farm_mode"):
             self.state["farm_mode"] = "riverbank"
             self.save()
-        if self.state.get("farm_height_mode") != "hydrated_single_water_level_v2":
-            self.state["farm_height_mode"] = "hydrated_single_water_level_v2"
+        if self.state.get("farm_height_mode") != "hydrated_daylight_riverbank_v4":
+            self.state["farm_height_mode"] = "hydrated_daylight_riverbank_v4"
             self.state.pop("riverbank_farm_positions", None)
             self.state["farm_blocks_done"] = []
+            self.state.pop("abandoned_farm_positions", None)
             self.state.pop("cliff_path_plan", None)
             self.state["cliff_path_done"] = []
             self.save()
@@ -2851,6 +2852,48 @@ class PluginInstance(Plugin):
     def _is_hydrated_farm_tile(self, x, y, z):
         return self._is_water_near(x, y, z, 4)
 
+    def _farm_daylight_scan_height(self):
+        return int(self.agent.configs.get("farm_daylight_scan_height", 18))
+
+    def _farm_max_water_level_delta(self):
+        return int(self.agent.configs.get("farm_max_water_level_delta", 3))
+
+    def _farm_min_sky_light(self):
+        return int(self.agent.configs.get("farm_min_sky_light", 12))
+
+    def _farm_sky_light(self, x, y, z):
+        try:
+            for dy in [1, 2, 0]:
+                block = self.agent.bot.blockAt(vec3.Vec3(x, y + dy, z))
+                if block is None:
+                    continue
+                value = getattr(block, "skyLight", None)
+                if value is None:
+                    continue
+                return int(value)
+        except Exception:
+            return None
+        return None
+
+    def _farm_daylight_clear_cost(self, x, y, z):
+        empty = set(get_empty_block_names())
+        cost = 0
+        for dy in range(1, self._farm_daylight_scan_height() + 1):
+            name = self._block_name_at(x, y + dy, z)
+            if name is None or name in empty:
+                continue
+            if dy <= self._farm_terrace_cut_limit() and self._is_farm_clearable(name):
+                cost += 1
+                continue
+            return None
+        return cost
+
+    def _is_daylight_farm_tile(self, x, y, z):
+        sky_light = self._farm_sky_light(x, y, z)
+        if sky_light is not None and sky_light < self._farm_min_sky_light():
+            return False
+        return self._farm_daylight_clear_cost(x, y, z) is not None
+
     def _is_abandoned_farm_position(self, x, y, z):
         abandoned = self.state.get("abandoned_farm_positions", {}) or {}
         return "%d,%d,%d" % (x, y, z) in abandoned
@@ -2868,6 +2911,8 @@ class PluginInstance(Plugin):
             if self._is_abandoned_farm_position(x, y, z):
                 continue
             if not self._is_hydrated_farm_tile(x, y, z):
+                continue
+            if not self._is_daylight_farm_tile(x, y, z):
                 continue
             if self._farm_leveling_cost(x, y, z) is None:
                 continue
@@ -2955,13 +3000,19 @@ class PluginInstance(Plugin):
         return cost
 
     def _riverbank_farm_score(self, x, y, z, base, target_y):
-        if y != target_y:
+        if abs(y - target_y) > self._farm_max_water_level_delta():
             return None
         level_cost = self._farm_leveling_cost(x, y, z)
         if level_cost is None:
             return None
         hydrated = self._is_water_near(x, y, z, 4)
         if not hydrated:
+            return None
+        sky_light = self._farm_sky_light(x, y, z)
+        if sky_light is not None and sky_light < self._farm_min_sky_light():
+            return None
+        daylight_cost = self._farm_daylight_clear_cost(x, y, z)
+        if daylight_cost is None:
             return None
         distance = abs(x - base["x"]) + abs(z - base["z"])
         vertical = abs(y - target_y)
@@ -2970,7 +3021,7 @@ class PluginInstance(Plugin):
         chunk_x, chunk_z = self._chunk_coords(x, z)
         base_chunk_x, base_chunk_z = self._chunk_coords(base["x"], base["z"])
         chunk_cost = abs(chunk_x - base_chunk_x) + abs(chunk_z - base_chunk_z)
-        return 100 - 8 * level_cost - 7 * vertical - 3 * flatness - 2 * distance - 12 * hazard - chunk_cost
+        return 120 - 8 * level_cost - 6 * daylight_cost - 10 * vertical - 3 * flatness - 2 * distance - 12 * hazard - chunk_cost
 
     def _riverbank_candidate_positions(self):
         water_blocks = get_nearest_blocks(self.agent, ["water"], 64, 48)
@@ -2978,29 +3029,22 @@ class PluginInstance(Plugin):
         if not water_blocks:
             return []
         preferred_y = self._riverbank_search_target()["y"] - 1
-        water_levels = {}
-        for water in water_blocks:
-            wy = int(water.position.y)
-            water_levels[wy] = water_levels.get(wy, 0) + 1
-        target_y = sorted(water_levels.keys(), key=lambda y: (-water_levels[y], abs(y - preferred_y), y))[0]
         candidates = []
         seen = set()
         for water in water_blocks:
             wx, wy, wz = int(water.position.x), int(water.position.y), int(water.position.z)
-            if wy != target_y:
-                continue
             for dx in range(-4, 5):
                 for dz in range(-4, 5):
                     if max(abs(dx), abs(dz)) > 4 or (dx == 0 and dz == 0):
                         continue
-                    x, y, z = wx + dx, target_y, wz + dz
+                    x, y, z = wx + dx, wy, wz + dz
                     key = "%d,%d,%d" % (x, y, z)
                     if key in seen:
                         continue
                     seen.add(key)
                     if self._is_abandoned_farm_position(x, y, z):
                         continue
-                    score = self._riverbank_farm_score(x, y, z, base, target_y)
+                    score = self._riverbank_farm_score(x, y, z, base, preferred_y)
                     if score is None:
                         continue
                     candidates.append((-score, x, y, z))
