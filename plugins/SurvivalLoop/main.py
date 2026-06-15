@@ -98,7 +98,7 @@ class PluginInstance(Plugin):
         write_json(self.state, self.save_path)
 
     def _upgrade_route_strategy_state(self):
-        version = "pathfinder_cost_high_tree_v33"
+        version = "pathfinder_cost_high_tree_v38"
         if self.state.get("resource_route_strategy_version") == version:
             return
         failures = dict(self.state.get("resource_path_plan_failures", {}) or {})
@@ -111,17 +111,8 @@ class PluginInstance(Plugin):
                 if not (str(item).startswith("tree_high:") or str(item).startswith("tree_search:"))
             ]
         self.state["resource_route_strategy_version"] = version
-        blocked = self.state.get("blocked_build_positions", [])
-        if isinstance(blocked, list):
-            self.state["blocked_build_positions"] = [
-                item for item in blocked
-                if not self._is_high_tree_route_block_key(item)
-            ]
-        build_failures = dict(self.state.get("build_position_failures", {}) or {})
-        self.state["build_position_failures"] = {
-            key: value for key, value in build_failures.items()
-            if not self._is_high_tree_route_block_key(key)
-        }
+        self.state["blocked_build_positions"] = []
+        self.state["build_position_failures"] = {}
         for key in list(self.state.keys()):
             if str(key).startswith("resource_path_") and key != "resource_path_plan_failures":
                 self.state.pop(key, None)
@@ -284,7 +275,7 @@ class PluginInstance(Plugin):
             if high_tree is not None:
                 if self._completed_high_tree_route(high_tree) is not None:
                     return "collect_logs"
-                if inv.get("dirt", 0) + inv.get("grass_block", 0) < 8:
+                if self._should_collect_more_dirt_before_resource_path(inv):
                     return "collect_dirt"
                 return "build_resource_path"
         if self._should_escape_cave(inv):
@@ -300,7 +291,7 @@ class PluginInstance(Plugin):
                     if high_tree is not None and not self._is_unreachable_resource_target(high_tree):
                         if self._completed_high_tree_route(high_tree) is not None:
                             return "collect_logs"
-                        if inv.get("dirt", 0) + inv.get("grass_block", 0) < 8:
+                        if self._should_collect_more_dirt_before_resource_path(inv):
                             return "collect_dirt"
                         return "build_resource_path"
                     return "find_trees"
@@ -308,7 +299,7 @@ class PluginInstance(Plugin):
                     target = {"kind": "tree_high", "x": int(block.position.x), "y": int(block.position.y), "z": int(block.position.z)}
                     if self._is_unreachable_resource_target(target):
                         return "find_trees"
-                    if inv.get("dirt", 0) + inv.get("grass_block", 0) < 8:
+                    if self._should_collect_more_dirt_before_resource_path(inv):
                         return "collect_dirt"
                     return "build_resource_path"
                 return "collect_logs"
@@ -418,6 +409,15 @@ class PluginInstance(Plugin):
         max_distance = 56 if self.state.get("farm_mode") == "riverbank" else 24
         return abs(dy) > 12 or math.sqrt(dx * dx + dz * dz) > max_distance
 
+    def _should_collect_more_dirt_before_resource_path(self, inv):
+        have = inv.get("dirt", 0) + inv.get("grass_block", 0)
+        if have < 1:
+            return True
+        failures = int(self.state.get("dirt_stockpile_failures", 0) or 0)
+        if failures >= 2:
+            return False
+        return have < int(self.agent.configs.get("resource_path_preferred_dirt", 4))
+
     def _return_to_base(self):
         base = self._base()
         return go_to_position(self.agent, base["x"], base["y"], base["z"], 4)
@@ -467,6 +467,36 @@ class PluginInstance(Plugin):
         if self._block_name_at(x, y + 1, z) in self._route_gravity_block_names():
             return False
         return True
+
+    def _route_can_clear_headroom_name(self, block_name):
+        if block_name is None or block_name in get_empty_block_names():
+            return False
+        if block_name in self._liquid_block_names() or block_name in self._farm_danger_blocks():
+            return False
+        if self._required_tool_kind_for_block(block_name) == "pickaxe":
+            return False
+        return (
+            block_name in self._route_soft_clearable_names()
+            or block_name in self._farm_clearable_blocks()
+            or "leaves" in block_name
+        )
+
+    def _clear_resource_headroom(self, x, y, z):
+        block = self.agent.bot.blockAt(vec3.Vec3(x, y + 1, z))
+        block_name = None if block is None else block.name
+        if block_name is None or block_name in get_empty_block_names():
+            return True
+        if not self._route_can_clear_headroom_name(block_name):
+            return False
+        try:
+            go_to_position(self.agent, x, y, z, 4)
+            self.agent.bot.dig(block, timeout=45)
+            time.sleep(0.3)
+            self._report("I cleared a soft headroom block so the resource path can continue.")
+            return True
+        except Exception as e:
+            add_log(title=self.pack_message("Resource path headroom clearing failed."), content=str(e), label="warning")
+            return False
 
     def _route_clearance_step(self, x, ground_y, z, mode):
         empty = set(get_empty_block_names())
@@ -1494,53 +1524,70 @@ class PluginInstance(Plugin):
             ty = sy + min(segment, max(0, ty - sy))
             dx = tx - sx
             dz = tz - sz
-        plan = []
         dy = max(0, ty - sy)
         horizontal = max(abs(dx) + abs(dz), 1)
         steps = max(horizontal, dy + 2)
         if steps > max(12, self._resource_route_scan_radius()):
             steps = max(12, self._resource_route_scan_radius())
-        seen = set()
-        for step in plan:
-            if len(step) >= 3:
-                seen.add(self._build_key(step[0], step[1], step[2]))
-        def add_ramp_step(px, py, pz, force_bridge=False):
-            key = self._build_key(px, py, pz)
-            if key in seen:
-                return True
-            if self._is_build_position_blocked(px, py, pz):
-                return False
-            seen.add(key)
-            mode = "start" if not plan else ("jump" if py > plan[-1][1] else "walk")
-            ground = self._block_name_at(px, py, pz)
-            head = self._block_name_at(px, py + 1, pz)
-            empty = set(get_empty_block_names())
-            if not force_bridge and ground in self._walkable_ground_names() and (head is None or head in empty):
-                if self._is_hard_route_ground_without_tool(ground):
-                    mode = "jump_hard" if mode == "jump" else "walk_hard"
-                plan.append([px, py, pz, mode])
-            else:
-                plan.append([px, py, pz, "bridge"])
-            return True
-        x, z, y = sx, sz, sy
         x_dir = 1 if tx > sx else -1
         z_dir = 1 if tz > sz else -1
-        for i in range(steps + 1):
-            previous_y = y
-            if i > 0:
-                if abs(tx - x) >= abs(tz - z) and x != tx:
-                    x += x_dir
-                elif z != tz:
-                    z += z_dir
-                elif x != tx:
-                    x += x_dir
-                if y < ty:
-                    y += 1
-            if y > previous_y and not add_ramp_step(x, previous_y, z, force_bridge=True):
-                break
-            if not add_ramp_step(x, y, z):
-                break
-        return plan
+
+        def make_plan(prefer_axis):
+            plan = []
+            seen = set()
+
+            def add_ramp_step(px, py, pz, force_bridge=False):
+                key = self._build_key(px, py, pz)
+                if key in seen:
+                    return True
+                if self._is_build_position_blocked(px, py, pz):
+                    return False
+                ground = self._block_name_at(px, py, pz)
+                head = self._block_name_at(px, py + 1, pz)
+                empty = set(get_empty_block_names())
+                if ground in self._walkable_ground_names() and head not in empty and not self._route_can_clear_headroom_name(head):
+                    return False
+                seen.add(key)
+                mode = "start" if not plan else ("jump" if py > plan[-1][1] else "walk")
+                if not force_bridge and ground in self._walkable_ground_names() and (head is None or head in empty):
+                    if self._is_hard_route_ground_without_tool(ground):
+                        mode = "jump_hard" if mode == "jump" else "walk_hard"
+                    plan.append([px, py, pz, mode])
+                else:
+                    plan.append([px, py, pz, "bridge"])
+                return True
+
+            x, z, y = sx, sz, sy
+            for i in range(steps + 1):
+                previous_y = y
+                if i > 0:
+                    moved = False
+                    axes = [prefer_axis, "z" if prefer_axis == "x" else "x"]
+                    for axis in axes:
+                        if axis == "x" and x != tx:
+                            x += x_dir
+                            moved = True
+                            break
+                        if axis == "z" and z != tz:
+                            z += z_dir
+                            moved = True
+                            break
+                    if not moved:
+                        break
+                    if y < ty:
+                        y += 1
+                if y > previous_y and not add_ramp_step(x, previous_y, z, force_bridge=True):
+                    break
+                if not add_ramp_step(x, y, z):
+                    break
+            return plan
+
+        plans = [make_plan("x"), make_plan("z")]
+        plans = [plan for plan in plans if len(plan) > 1]
+        if not plans:
+            return []
+        plans.sort(key=len, reverse=True)
+        return plans[0]
 
     def _resource_path_plan(self, target):
         state_key = self._resource_path_key_for(target)
@@ -1648,6 +1695,8 @@ class PluginInstance(Plugin):
             done = set(self.state.get(key + "_done", []) or [])
             if len(done) < len(plan):
                 return None
+            if target.get("kind") == "tree_high" and not self._tree_high_route_reached_target(target, plan):
+                return None
             return {"key": key, "plan": plan, "top": plan[-1]}
         pos = get_entity_position(self.agent.bot.entity)
         routes = []
@@ -1720,9 +1769,15 @@ class PluginInstance(Plugin):
             empty = set(get_empty_block_names())
             if target is not None and target not in empty and target not in self._liquid_block_names():
                 if target in self._walkable_ground_names():
+                    if not self._resource_path_walkable(x, y, z):
+                        if self._clear_resource_headroom(x, y, z):
+                            return True
+                        self._mark_build_failure(x, y, z, "resource route walkable block has hard blocked headroom", limit=1)
+                        return False
+                    moved = self._move_to_resource_step(x, y, z, mode)
                     self._mark_build_success(x, y, z)
                     self._remember_recent_route_block(x, y, z)
-                    return True
+                    return moved
                 if self._route_can_break_name(x, y, z, target):
                     block = self.agent.bot.blockAt(vec3.Vec3(x, y, z))
                     try:
@@ -1786,14 +1841,9 @@ class PluginInstance(Plugin):
         pos = get_entity_position(self.agent.bot.entity)
         if pos is None:
             return False
-        if math.floor(pos.x) != int(x) or math.floor(pos.z) != int(z) or math.floor(pos.y) != int(y):
+        if math.floor(pos.x) != int(x) or math.floor(pos.z) != int(z) or math.floor(pos.y) != int(y) + 1:
             return False
-        current = self._block_name_at(x, y, z)
-        below = self._block_name_at(x, y - 1, z)
-        empty = set(get_empty_block_names())
-        if current is not None and current not in empty:
-            return False
-        return below in self._walkable_ground_names()
+        return self._resource_path_walkable(x, y, z)
 
     def _build_resource_path_step(self):
         inv = get_item_counts(self.agent)
@@ -2405,6 +2455,8 @@ class PluginInstance(Plugin):
         blocks = get_nearest_blocks(self.agent, ["dirt", "grass_block"], 32, 32)
         blocks = [block for block in blocks if self._safe_dirt_block(block)]
         if not blocks:
+            self.state["dirt_stockpile_failures"] = int(self.state.get("dirt_stockpile_failures", 0) or 0) + 1
+            self.save()
             add_log(
                 title=self.pack_message("No safe dirt stockpile source."),
                 content="Avoiding wet or unstable dirt near current position; will move before trying again.",
@@ -2431,8 +2483,12 @@ class PluginInstance(Plugin):
         after = get_item_counts(self.agent)
         now = after.get("dirt", 0) + after.get("grass_block", 0)
         if now > have:
+            self.state["dirt_stockpile_failures"] = 0
+            self.save()
             self._report("I collected dirt for farm platforms: %d/%d." % (now, target))
             return True
+        self.state["dirt_stockpile_failures"] = int(self.state.get("dirt_stockpile_failures", 0) or 0) + 1
+        self.save()
         return False
 
     def _should_plant_saplings(self, inv):
