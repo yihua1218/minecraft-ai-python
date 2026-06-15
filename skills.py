@@ -308,35 +308,76 @@ def _safe_pathfinder(agent, reason="movement"):
         add_log(title=agent.pack_message("Pathfinder check failed."), content="%s: %s" % (reason, e), label="warning")
         return None
 
-def _safe_movements(agent, allow_dig=False):
+def _scaffolding_item_ids(agent):
+    preferred = agent.configs.get("movement_scaffolding_blocks", [
+        "dirt", "grass_block", "coarse_dirt", "cobblestone", "stone", "andesite", "diorite", "granite",
+    ])
+    counts = get_item_counts(agent)
+    ids = []
+    for name in preferred:
+        if counts.get(name, 0) <= 0:
+            continue
+        item_id = get_item_id(name)
+        if item_id is not None:
+            ids.append(item_id)
+    return ids
+
+def _safe_movements(agent, allow_dig=False, allow_place=False):
     movements = pathfinder.Movements(agent.bot)
     try:
         movements.canDig = bool(allow_dig)
-        movements.canPlaceOn = False
-        movements.allow1by1towers = False
+        movements.allow1by1towers = bool(allow_place)
+        movements.allowParkour = True
+        movements.placeCost = float(agent.configs.get("movement_place_cost", 8))
+        if allow_place:
+            scaffold_ids = _scaffolding_item_ids(agent)
+            if scaffold_ids:
+                movements.scafoldingBlocks = scaffold_ids
+        else:
+            movements.scafoldingBlocks = []
     except Exception:
         pass
     return movements
 
+def _go_to_position_attempt(agent, x, y, z, closeness, allow_place=False):
+    pf = _safe_pathfinder(agent, "go_to_position target (%.1f, %.1f, %.1f)" % (x, y, z))
+    if pf is None:
+        return False
+    if allow_place and not _scaffolding_item_ids(agent):
+        add_log(
+            title=agent.pack_message("Movement has no scaffold blocks."),
+            content="Target: (%.1f, %.1f, %.1f)" % (x, y, z),
+            label="warning",
+        )
+        return False
+    pf.setMovements(_safe_movements(agent, allow_dig=False, allow_place=allow_place))
+    pf.setGoal(pathfinder.goals.GoalNear(x, y, z, closeness))
+    time.sleep(0.1)
+    timeout_key = "movement_build_timeout_seconds" if allow_place else "movement_timeout_seconds"
+    default_timeout = 35 if allow_place else 20
+    deadline = time.time() + float(agent.configs.get(timeout_key, default_timeout))
+    while pf.isMoving() :
+        if time.time() > deadline:
+            try:
+                pf.stop()
+            except Exception:
+                pass
+            mode = "with scaffold fallback" if allow_place else "on existing path"
+            add_log(
+                title=agent.pack_message("Movement timed out."),
+                content="Target: (%.1f, %.1f, %.1f), mode: %s" % (x, y, z, mode),
+                label="warning",
+            )
+            return False
+        time.sleep(0.2)
+    return True
+
 def go_to_position(agent, x, y, z, closeness = 0) : 
     """Command the agent to move to (x, y, z) position with a target 'closeness' tolerance; call with go_to_position(agent, x, y, z, closeness)."""
     try :
-        pf = _safe_pathfinder(agent, "go_to_position target (%.1f, %.1f, %.1f)" % (x, y, z))
-        if pf is None:
-            return False
-        pf.setMovements(_safe_movements(agent, allow_dig=False))
-        pf.setGoal(pathfinder.goals.GoalNear(x, y, z, closeness))
-        time.sleep(0.1)
-        deadline = time.time() + float(agent.configs.get("movement_timeout_seconds", 20))
-        while pf.isMoving() :
-            if time.time() > deadline:
-                try:
-                    pf.stop()
-                except Exception:
-                    pass
-                add_log(title = agent.pack_message("Movement timed out."), content = "Target: (%.1f, %.1f, %.1f)" % (x, y, z), label = "warning")
+        if not _go_to_position_attempt(agent, x, y, z, closeness, allow_place=False):
+            if not _go_to_position_attempt(agent, x, y, z, closeness, allow_place=True):
                 return False
-            time.sleep(0.2)
         send_chat(agent, "I have arrived at the position (%.1f, %.1f, %.1f)." % (x, y, z))
         return True
     except Exception as e : 
