@@ -235,7 +235,7 @@ class PluginInstance(Plugin):
             if action == "craft_table":
                 return craft(self.agent, "crafting_table", 1)
             if action == "collect_dirt":
-                return collect_blocks(self.agent, "dirt", 8)
+                return self._collect_dirt_stockpile()
             if action == "craft_chest":
                 return self._craft_chest()
             if action == "place_storage_chest":
@@ -2361,6 +2361,73 @@ class PluginInstance(Plugin):
                 inv = get_item_counts(self.agent)
             if not planted_any and replant_site is not None:
                 self._report("I recorded the tree site and will replant it as soon as I collect a matching sapling.")
+            return True
+        return False
+
+    def _dirt_stockpile_target(self):
+        return int(self.agent.configs.get("dirt_stockpile_target", 32))
+
+    def _safe_dirt_block(self, block):
+        if block is None or block.name not in ["dirt", "grass_block"]:
+            return False
+        x, y, z = int(block.position.x), int(block.position.y), int(block.position.z)
+        if self._is_recent_route_block(x, y, z):
+            return False
+        if self._is_water_near(x, y, z, 1):
+            return False
+        above = self._block_name_at(x, y + 1, z)
+        if above not in get_empty_block_names():
+            return False
+        below = self._block_name_at(x, y - 1, z)
+        if not self._solid_farm_base(below):
+            return False
+        for dx, dz in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            if self._block_name_at(x + dx, y, z + dz) in self._liquid_block_names():
+                return False
+        try:
+            movements = pathfinder.Movements(self.agent.bot)
+            if not movements.safeToBreak(block):
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _collect_dirt_stockpile(self):
+        inv = get_item_counts(self.agent)
+        have = inv.get("dirt", 0) + inv.get("grass_block", 0)
+        target = self._dirt_stockpile_target()
+        if have >= target:
+            self._report("I have enough dirt for farm platforms for now.")
+            return True
+        blocks = get_nearest_blocks(self.agent, ["dirt", "grass_block"], 32, 32)
+        blocks = [block for block in blocks if self._safe_dirt_block(block)]
+        if not blocks:
+            add_log(
+                title=self.pack_message("No safe dirt stockpile source."),
+                content="Avoiding wet or unstable dirt near current position; will move before trying again.",
+                label="warning",
+            )
+            return self._return_to_base()
+        collected = 0
+        for block in blocks[: min(8, target - have)]:
+            if not self._can_safely_dig_block(block, "dirt stockpile"):
+                continue
+            try:
+                go_to_position(self.agent, block.position.x, block.position.y + 1, block.position.z, 3)
+                block = self.agent.bot.blockAt(block.position)
+                if block is None or not self._safe_dirt_block(block):
+                    continue
+                self.agent.bot.dig(block, timeout=30)
+                time.sleep(0.3)
+                pickup_nearby_items(self.agent, 6, 8)
+                collected += 1
+            except Exception as e:
+                add_log(title=self.pack_message("Dirt stockpile dig failed."), content=str(e), label="warning")
+                continue
+        after = get_item_counts(self.agent)
+        now = after.get("dirt", 0) + after.get("grass_block", 0)
+        if now > have:
+            self._report("I collected dirt for farm platforms: %d/%d." % (now, target))
             return True
         return False
 
