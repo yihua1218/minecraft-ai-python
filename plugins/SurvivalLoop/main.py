@@ -75,8 +75,8 @@ class PluginInstance(Plugin):
         if not self.state.get("farm_mode"):
             self.state["farm_mode"] = "riverbank"
             self.save()
-        if self.state.get("farm_height_mode") != "hydrated_daylight_expansion_v5":
-            self.state["farm_height_mode"] = "hydrated_daylight_expansion_v5"
+        if self.state.get("farm_height_mode") != "hydrated_daylight_bridge_farm_v6":
+            self.state["farm_height_mode"] = "hydrated_daylight_bridge_farm_v6"
             self.state.pop("riverbank_farm_positions", None)
             self.state["farm_blocks_done"] = []
             self.state.pop("abandoned_farm_positions", None)
@@ -2876,6 +2876,9 @@ class PluginInstance(Plugin):
     def _farm_expansion_target_tiles(self):
         return int(self.agent.configs.get("farm_expansion_target_tiles", 48))
 
+    def _farm_bridge_support_cost(self):
+        return int(self.agent.configs.get("farm_bridge_support_cost", 5))
+
     def _farm_sky_light(self, x, y, z):
         try:
             for dy in [1, 2, 0]:
@@ -2971,11 +2974,49 @@ class PluginInstance(Plugin):
             return self._has_build_support(x, y, z)
         return self._can_place_supported(x, y, z, "farm dirt placement")
 
+    def _can_bridge_farm_tile(self, x, y, z):
+        target = self._block_name_at(x, y, z)
+        empty = set(get_empty_block_names())
+        if target is not None and target not in empty:
+            return False
+        if self._has_build_support(x, y, z):
+            return True
+        support_y = y - 1
+        support_target = self._block_name_at(x, support_y, z)
+        if support_target is not None and support_target not in empty:
+            return self._has_build_support(x, y, z)
+        return self._has_build_support(x, support_y, z)
+
+    def _place_farm_bridge_support(self, x, y, z):
+        support_y = int(y) - 1
+        target = self._block_name_at(x, support_y, z)
+        empty = set(get_empty_block_names())
+        if target is not None and target not in empty:
+            return self._has_build_support(x, y, z)
+        if not self._has_build_support(x, support_y, z):
+            return False
+        block_name = "dirt"
+        inv = get_item_counts(self.agent)
+        if inv.get("dirt", 0) < 1 and inv.get("grass_block", 0) > 0:
+            block_name = "grass_block"
+        try:
+            if place_block(self.agent, block_name, x, support_y, z, "bottom", True):
+                self._mark_build_success(x, support_y, z)
+                self._report("I placed support dirt under the farm bridge platform.")
+                return True
+        except Exception as e:
+            add_log(title=self.pack_message("Farm bridge support placement failed."), content=str(e), label="warning")
+        return False
+
     def _farm_leveling_cost(self, x, y, z):
         ground = self._block_name_at(x, y, z)
         if ground == "water" and self._is_shallow_farm_water(x, y, z):
             cost = 2
-        elif ground in [None, "water", "lava"] or ground in self._farm_danger_blocks():
+        elif ground is None or ground in get_empty_block_names():
+            if not self._can_bridge_farm_tile(x, y, z):
+                return None
+            cost = self._farm_bridge_support_cost()
+        elif ground in ["water", "lava"] or ground in self._farm_danger_blocks():
             return None
         else:
             cost = 0
@@ -2988,7 +3029,10 @@ class PluginInstance(Plugin):
             cost += 1
         below = self._block_name_at(x, y - 1, z)
         if not self._solid_farm_base(below):
-            cost += 4
+            if self._can_bridge_farm_tile(x, y, z):
+                cost += self._farm_bridge_support_cost()
+            else:
+                cost += 4
         return cost
 
     def _farm_hazard_penalty(self, x, y, z):
@@ -3326,6 +3370,15 @@ class PluginInstance(Plugin):
                         self._mark_build_failure(x, y, z, "farm ground removal failed")
                         add_log(title=self.pack_message("Farm ground removal failed."), content=str(e), label="warning")
                         self._abandon_farm_position(x, y, z, "farm ground removal failed")
+                        continue
+                if block is None or block.name in empty:
+                    if inv.get("dirt", 0) + inv.get("grass_block", 0) < 2:
+                        return collect_blocks(self.agent, "dirt", 12)
+                    if not self._has_build_support(x, y, z):
+                        if self._place_farm_bridge_support(x, y, z):
+                            return True
+                        self._mark_build_failure(x, y, z, "farm bridge platform has no adjacent support", limit=1)
+                        self._abandon_farm_position(x, y, z, "farm bridge platform has no adjacent support")
                         continue
                 if inv.get("dirt", 0) + inv.get("grass_block", 0) < 1:
                     return collect_blocks(self.agent, "dirt", 8)
