@@ -2851,6 +2851,10 @@ class PluginInstance(Plugin):
     def _is_hydrated_farm_tile(self, x, y, z):
         return self._is_water_near(x, y, z, 4)
 
+    def _is_abandoned_farm_position(self, x, y, z):
+        abandoned = self.state.get("abandoned_farm_positions", {}) or {}
+        return "%d,%d,%d" % (x, y, z) in abandoned
+
     def _filter_hydrated_farm_positions(self, positions):
         filtered = []
         seen = set()
@@ -2860,6 +2864,8 @@ class PluginInstance(Plugin):
             x, y, z = int(pos[0]), int(pos[1]), int(pos[2])
             key = "%d,%d,%d" % (x, y, z)
             if key in seen:
+                continue
+            if self._is_abandoned_farm_position(x, y, z):
                 continue
             if not self._is_hydrated_farm_tile(x, y, z):
                 continue
@@ -2992,6 +2998,8 @@ class PluginInstance(Plugin):
                     if key in seen:
                         continue
                     seen.add(key)
+                    if self._is_abandoned_farm_position(x, y, z):
+                        continue
                     score = self._riverbank_farm_score(x, y, z, base, target_y)
                     if score is None:
                         continue
@@ -3065,6 +3073,36 @@ class PluginInstance(Plugin):
             return riverbank
         return self._fixed_farm_positions()
 
+    def _abandon_farm_position(self, x, y, z, reason):
+        key = "%d,%d,%d" % (x, y, z)
+        changed = False
+        saved = self.state.get("riverbank_farm_positions")
+        if isinstance(saved, list):
+            kept = []
+            for pos in saved:
+                if not isinstance(pos, (list, tuple)) or len(pos) < 3:
+                    continue
+                pos_key = "%d,%d,%d" % (int(pos[0]), int(pos[1]), int(pos[2]))
+                if pos_key == key:
+                    changed = True
+                    continue
+                kept.append([int(pos[0]), int(pos[1]), int(pos[2])])
+            self.state["riverbank_farm_positions"] = kept
+        done = set(self.state.get("farm_blocks_done", []))
+        if key in done:
+            done.remove(key)
+            self.state["farm_blocks_done"] = sorted(done)
+            changed = True
+        abandoned = dict(self.state.get("abandoned_farm_positions", {}) or {})
+        abandoned[key] = {"reason": reason, "t": time.time()}
+        self.state["abandoned_farm_positions"] = abandoned
+        self.save()
+        add_log(
+            title=self.pack_message("Abandoned farm position."),
+            content="%s at %s; trying another hydrated riverbank tile." % (reason, key),
+            label="warning",
+        )
+
     def _farm_plot_ready(self):
         done = set(self.state.get("farm_blocks_done", []))
         return len(done) >= len(self._farm_positions())
@@ -3088,6 +3126,7 @@ class PluginInstance(Plugin):
                 continue
             pos = vec3.Vec3(x, y, z)
             block = self.agent.bot.blockAt(pos)
+            abandoned_tile = False
             for clear_y in range(y + self._farm_terrace_cut_limit(), y, -1):
                 above = self.agent.bot.blockAt(vec3.Vec3(x, clear_y, z))
                 if above is None or above.name in empty:
@@ -3095,31 +3134,60 @@ class PluginInstance(Plugin):
                 if not self._is_farm_clearable(above.name):
                     self._mark_build_failure(x, clear_y, z, "farm terrace blocked by %s" % above.name)
                     add_log(title=self.pack_message("Farm terrace blocked."), content="%s at (%d, %d, %d)" % (above.name, x, clear_y, z), label="warning")
-                    return False
-                if not self._can_safely_dig_block(above, "farm terrace clearing"):
-                    return False
+                    self._abandon_farm_position(x, y, z, "farm terrace blocked by %s" % above.name)
+                    abandoned_tile = True
+                    break
                 try:
                     go_to_position(self.agent, x, y + 1, z, 4)
+                except Exception as e:
+                    self._mark_build_failure(x, clear_y, z, "farm terrace approach failed")
+                    add_log(title=self.pack_message("Farm terrace approach failed."), content=str(e), label="warning")
+                    self._abandon_farm_position(x, y, z, "farm terrace approach failed")
+                    abandoned_tile = True
+                    break
+                above = self.agent.bot.blockAt(vec3.Vec3(x, clear_y, z))
+                if above is None or above.name in empty:
+                    return True
+                if not self._can_safely_dig_block(above, "farm terrace clearing"):
+                    self._abandon_farm_position(x, y, z, "farm terrace cannot clear %s" % above.name)
+                    abandoned_tile = True
+                    break
+                try:
                     self.agent.bot.dig(above, timeout=45)
                     self._report("I dug overhead blocks to open a terrace for farmland.")
                     return True
                 except Exception as e:
                     self._mark_build_failure(x, clear_y, z, "farm clearing failed")
                     add_log(title=self.pack_message("Farm clearing failed."), content=str(e), label="warning")
-                    return False
+                    self._abandon_farm_position(x, y, z, "farm terrace clearing failed")
+                    abandoned_tile = True
+                    break
+            if abandoned_tile:
+                continue
             if block is None or block.name not in ["dirt", "grass_block", "farmland"]:
                 if block is not None and self._is_farm_clearable(block.name):
-                    if not self._can_safely_dig_block(block, "farm ground removal"):
-                        return False
                     try:
                         go_to_position(self.agent, x, y + 1, z, 4)
+                    except Exception as e:
+                        self._mark_build_failure(x, y, z, "farm ground approach failed")
+                        add_log(title=self.pack_message("Farm ground approach failed."), content=str(e), label="warning")
+                        self._abandon_farm_position(x, y, z, "farm ground approach failed")
+                        continue
+                    block = self.agent.bot.blockAt(pos)
+                    if block is None or block.name in ["dirt", "grass_block", "farmland"]:
+                        continue
+                    if not self._can_safely_dig_block(block, "farm ground removal"):
+                        self._abandon_farm_position(x, y, z, "farm ground cannot remove %s" % block.name)
+                        continue
+                    try:
                         self.agent.bot.dig(block, timeout=45)
                         self._report("I removed rough riverbank ground so I can replace it with farm soil.")
                         return True
                     except Exception as e:
                         self._mark_build_failure(x, y, z, "farm ground removal failed")
                         add_log(title=self.pack_message("Farm ground removal failed."), content=str(e), label="warning")
-                        return False
+                        self._abandon_farm_position(x, y, z, "farm ground removal failed")
+                        continue
                 if inv.get("dirt", 0) + inv.get("grass_block", 0) < 1:
                     return collect_blocks(self.agent, "dirt", 8)
                 placed = False
@@ -3138,7 +3206,8 @@ class PluginInstance(Plugin):
                     self.save()
                     return True
                 self._mark_build_failure(x, y, z, "farm dirt placement failed")
-                return False
+                self._abandon_farm_position(x, y, z, "farm dirt placement failed")
+                continue
             if key not in done:
                 self._mark_build_success(x, y, z)
                 done.add(key)
