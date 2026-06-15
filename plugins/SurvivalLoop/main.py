@@ -75,11 +75,12 @@ class PluginInstance(Plugin):
         if not self.state.get("farm_mode"):
             self.state["farm_mode"] = "riverbank"
             self.save()
-        if self.state.get("farm_height_mode") != "hydrated_daylight_riverbank_v4":
-            self.state["farm_height_mode"] = "hydrated_daylight_riverbank_v4"
+        if self.state.get("farm_height_mode") != "hydrated_daylight_expansion_v5":
+            self.state["farm_height_mode"] = "hydrated_daylight_expansion_v5"
             self.state.pop("riverbank_farm_positions", None)
             self.state["farm_blocks_done"] = []
             self.state.pop("abandoned_farm_positions", None)
+            self.state.pop("farm_expansion_plan", None)
             self.state.pop("cliff_path_plan", None)
             self.state["cliff_path_done"] = []
             self.save()
@@ -272,7 +273,7 @@ class PluginInstance(Plugin):
         cobble = inv.get("cobblestone", 0)
         prepared_tiles = self._prepared_farm_tile_count()
         farm_capacity = len(self._farm_positions())
-        minimum_tiles = min(12, farm_capacity) if farm_capacity > 0 else 0
+        minimum_tiles = min(self._farm_initial_target_tiles(), farm_capacity) if farm_capacity > 0 else 0
         farm_failures = int(self.state.get("farm_failures", 0) or 0)
         stone_failures = int(self.state.get("stone_failures", 0) or 0)
         if self._is_survival_stuck():
@@ -320,6 +321,14 @@ class PluginInstance(Plugin):
             return "craft_wooden_tools"
         if self._should_return_to_base():
             return "return_base"
+        if self.state.get("farm_mode") == "riverbank" and not self._has_riverbank_farm_plan():
+            return "find_riverbank"
+        if self.state.get("farm_mode") == "riverbank" and self._has_riverbank_farm_plan():
+            if prepared_tiles < minimum_tiles:
+                return "prepare_farm_plot"
+            if self._has_mature_wheat_nearby() or seeds > 0:
+                return "farm"
+            return "collect_seeds"
         if self._needs_resource_path(inv):
             if inv.get("dirt", 0) + inv.get("grass_block", 0) < 4:
                 return "collect_dirt"
@@ -2861,6 +2870,12 @@ class PluginInstance(Plugin):
     def _farm_min_sky_light(self):
         return int(self.agent.configs.get("farm_min_sky_light", 12))
 
+    def _farm_initial_target_tiles(self):
+        return int(self.agent.configs.get("farm_initial_target_tiles", 24))
+
+    def _farm_expansion_target_tiles(self):
+        return int(self.agent.configs.get("farm_expansion_target_tiles", 48))
+
     def _farm_sky_light(self, x, y, z):
         try:
             for dy in [1, 2, 0]:
@@ -3023,8 +3038,89 @@ class PluginInstance(Plugin):
         chunk_cost = abs(chunk_x - base_chunk_x) + abs(chunk_z - base_chunk_z)
         return 120 - 8 * level_cost - 6 * daylight_cost - 10 * vertical - 3 * flatness - 2 * distance - 12 * hazard - chunk_cost
 
+    def _connected_farm_component(self, start, remaining):
+        stack = [start]
+        component = set()
+        while stack:
+            key = stack.pop()
+            if key in component or key not in remaining:
+                continue
+            component.add(key)
+            x, y, z = key
+            for dx, dz in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                neighbor = (x + dx, y, z + dz)
+                if neighbor in remaining and neighbor not in component:
+                    stack.append(neighbor)
+        return component
+
+    def _order_farm_patch(self, component, score_by_key, target_size):
+        seed = max(component, key=lambda key: score_by_key.get(key, -9999))
+        selected = [seed]
+        selected_set = set([seed])
+        frontier = set()
+        while len(selected) < target_size:
+            x, y, z = selected[-1]
+            for sx, sy, sz in list(selected_set):
+                for dx, dz in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                    neighbor = (sx + dx, sy, sz + dz)
+                    if neighbor in component and neighbor not in selected_set:
+                        frontier.add(neighbor)
+            if not frontier:
+                break
+            best = max(frontier, key=lambda key: score_by_key.get(key, -9999))
+            frontier.remove(best)
+            selected.append(best)
+            selected_set.add(best)
+        return selected
+
+    def _select_farm_expansion_patch(self, scored_candidates):
+        if not scored_candidates:
+            return []
+        target_size = self._farm_expansion_target_tiles()
+        score_by_key = {}
+        remaining = set()
+        for score, x, y, z in scored_candidates:
+            key = (int(x), int(y), int(z))
+            score_by_key[key] = max(score_by_key.get(key, -9999), score)
+            remaining.add(key)
+        components = []
+        unvisited = set(remaining)
+        while unvisited:
+            start = next(iter(unvisited))
+            component = self._connected_farm_component(start, remaining)
+            unvisited.difference_update(component)
+            if len(component) < 3:
+                continue
+            ordered = self._order_farm_patch(component, score_by_key, target_size)
+            top_scores = sorted([score_by_key[key] for key in ordered], reverse=True)
+            patch_score = sum(top_scores) + 6 * len(ordered)
+            xs = [key[0] for key in ordered]
+            zs = [key[2] for key in ordered]
+            width = max(xs) - min(xs) + 1
+            depth = max(zs) - min(zs) + 1
+            compactness = len(ordered) / float(max(1, width * depth))
+            patch_score += 20 * compactness
+            components.append((patch_score, len(ordered), ordered))
+        if not components:
+            return []
+        components.sort(key=lambda item: (-item[0], -item[1]))
+        selected = components[0][2]
+        self.state["farm_expansion_plan"] = {
+            "target_tiles": target_size,
+            "planned_tiles": len(selected),
+            "y": int(selected[0][1]),
+            "bounds": {
+                "min_x": min(key[0] for key in selected),
+                "max_x": max(key[0] for key in selected),
+                "min_z": min(key[2] for key in selected),
+                "max_z": max(key[2] for key in selected),
+            },
+        }
+        self.save()
+        return [(x, y, z) for x, y, z in selected]
+
     def _riverbank_candidate_positions(self):
-        water_blocks = get_nearest_blocks(self.agent, ["water"], 64, 48)
+        water_blocks = get_nearest_blocks(self.agent, ["water"], 72, 96)
         base = self._base()
         if not water_blocks:
             return []
@@ -3047,9 +3143,8 @@ class PluginInstance(Plugin):
                     score = self._riverbank_farm_score(x, y, z, base, preferred_y)
                     if score is None:
                         continue
-                    candidates.append((-score, x, y, z))
-        candidates.sort()
-        return [(x, y, z) for _, x, y, z in candidates[:36]]
+                    candidates.append((score, x, y, z))
+        return self._select_farm_expansion_patch(candidates)
 
     def _has_riverbank_farm_plan(self):
         saved = self.state.get("riverbank_farm_positions")
