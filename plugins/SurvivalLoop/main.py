@@ -2371,6 +2371,9 @@ class PluginInstance(Plugin):
         if block is None or block.name not in ["dirt", "grass_block"]:
             return False
         x, y, z = int(block.position.x), int(block.position.y), int(block.position.z)
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is not None and abs(y - math.floor(pos.y)) > 2:
+            return False
         if self._is_recent_route_block(x, y, z):
             return False
         if self._is_water_near(x, y, z, 1):
@@ -2410,10 +2413,11 @@ class PluginInstance(Plugin):
             return self._return_to_base()
         collected = 0
         for block in blocks[: min(8, target - have)]:
-            if not self._can_safely_dig_block(block, "dirt stockpile"):
-                continue
             try:
                 go_to_position(self.agent, block.position.x, block.position.y + 1, block.position.z, 3)
+                pos = get_entity_position(self.agent.bot.entity)
+                if pos is None or abs(pos.x - block.position.x) + abs(pos.y - (block.position.y + 1)) + abs(pos.z - block.position.z) > 6:
+                    continue
                 block = self.agent.bot.blockAt(block.position)
                 if block is None or not self._safe_dirt_block(block):
                     continue
