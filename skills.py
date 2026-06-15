@@ -350,6 +350,17 @@ def _reset_movement_controls(agent):
     except Exception:
         pass
 
+def _movement_reached_target(agent, x, y, z, closeness):
+    pos = get_entity_position(agent.bot.entity)
+    if pos is None:
+        return False, None
+    dx = pos.x - x
+    dy = pos.y - y
+    dz = pos.z - z
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    tolerance = max(float(closeness or 0), float(agent.configs.get("movement_min_arrival_tolerance", 0.75)))
+    return distance <= tolerance, distance
+
 def _go_to_position_attempt(agent, x, y, z, closeness, allow_place=False):
     pf = _safe_pathfinder(agent, "go_to_position target (%.1f, %.1f, %.1f)" % (x, y, z))
     if pf is None:
@@ -382,6 +393,19 @@ def _go_to_position_attempt(agent, x, y, z, closeness, allow_place=False):
                 )
                 return False
             time.sleep(0.2)
+        reached, distance = _movement_reached_target(agent, x, y, z, closeness)
+        if not reached:
+            pos = get_entity_position(agent.bot.entity)
+            mode = "with scaffold fallback" if allow_place else "on existing path"
+            current = "unknown" if pos is None else "(%.1f, %.1f, %.1f)" % (pos.x, pos.y, pos.z)
+            add_log(
+                title=agent.pack_message("Movement ended before reaching target."),
+                content="Target: (%.1f, %.1f, %.1f), current: %s, distance: %s, closeness: %.1f, mode: %s" % (
+                    x, y, z, current, "unknown" if distance is None else "%.2f" % distance, float(closeness or 0), mode,
+                ),
+                label="warning",
+            )
+            return False
         return True
     finally:
         _reset_movement_controls(agent)
