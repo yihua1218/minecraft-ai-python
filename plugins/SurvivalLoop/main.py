@@ -205,6 +205,8 @@ class PluginInstance(Plugin):
             self.save()
             add_log(title=self.pack_message("Survival loop step."), content=action, label="plugin")
             self._maybe_update_terrain_snapshot()
+            if action == "follow_rescue_player":
+                return self._follow_rescue_player_step()
             if action == "escape_cave":
                 return self._escape_cave_step()
             if action == "escape_stuck":
@@ -267,6 +269,8 @@ class PluginInstance(Plugin):
         minimum_tiles = min(self._farm_initial_target_tiles(), farm_capacity) if farm_capacity > 0 else 0
         farm_failures = int(self.state.get("farm_failures", 0) or 0)
         stone_failures = int(self.state.get("stone_failures", 0) or 0)
+        if self._should_follow_rescue_player():
+            return "follow_rescue_player"
         if self._is_survival_stuck():
             return "escape_stuck"
         if logs < 1 and planks < 6 and self._best_log_block() is None:
@@ -417,6 +421,134 @@ class PluginInstance(Plugin):
         if failures >= 2:
             return False
         return have < int(self.agent.configs.get("resource_path_preferred_dirt", 4))
+
+    def _rescue_follow_player_name(self):
+        name = self.state.get("rescue_follow_player") or self.agent.configs.get("survival_rescue_follow_player")
+        if not name:
+            return None
+        return str(name)
+
+    def _player_position(self, player_name):
+        try:
+            player = self.agent.bot.players[player_name]
+        except Exception:
+            return None
+        if player is None or getattr(player, "entity", None) is None:
+            return None
+        return get_entity_position(player.entity)
+
+    def _outside_enough_for_rescue(self):
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is None:
+            return False
+        x, y, z = math.floor(pos.x), math.floor(pos.y), math.floor(pos.z)
+        return self._open_above_count(x, y, z, 8) >= 7 and not self._is_stone_cave_context()
+
+    def _should_follow_rescue_player(self):
+        player_name = self._rescue_follow_player_name()
+        if player_name is None:
+            return False
+        player_pos = self._player_position(player_name)
+        pos = get_entity_position(self.agent.bot.entity)
+        if player_pos is None or pos is None:
+            return False
+        distance = abs(pos.x - player_pos.x) + abs(pos.y - player_pos.y) + abs(pos.z - player_pos.z)
+        if self._outside_enough_for_rescue() and distance <= 3:
+            self.state.pop("rescue_follow_player", None)
+            self.state["rescue_follow_completed_at"] = int(time.time())
+            self.save()
+            self._report("I reached the guide outside and will resume survival work.")
+            return False
+        action = self.state.get("last_survival_action")
+        return (
+            self._is_stone_cave_context()
+            or action in ["build_resource_path", "escape_stuck", "escape_cave", "collect_logs"]
+            or distance > 4
+        )
+
+    def _record_rescue_player_trail(self, player_name, player_pos):
+        trail = self.state.get("rescue_follow_trail", [])
+        if not isinstance(trail, list):
+            trail = []
+        point = {
+            "player": player_name,
+            "x": float(player_pos.x),
+            "y": float(player_pos.y),
+            "z": float(player_pos.z),
+            "t": int(time.time()),
+        }
+        if trail:
+            last = trail[-1]
+            moved = (
+                abs(float(last.get("x", point["x"])) - point["x"])
+                + abs(float(last.get("y", point["y"])) - point["y"])
+                + abs(float(last.get("z", point["z"])) - point["z"])
+            )
+            if moved < 2:
+                trail[-1] = point
+            else:
+                trail.append(point)
+        else:
+            trail.append(point)
+        cutoff = int(time.time()) - 240
+        self.state["rescue_follow_trail"] = [
+            item for item in trail[-64:]
+            if isinstance(item, dict) and item.get("player") == player_name and int(item.get("t", 0) or 0) >= cutoff
+        ]
+        self.save()
+
+    def _rescue_follow_target(self, player_name, player_pos):
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is None:
+            return player_pos
+        direct_distance = abs(pos.x - player_pos.x) + abs(pos.y - player_pos.y) + abs(pos.z - player_pos.z)
+        if direct_distance <= 10:
+            return player_pos
+        trail = self.state.get("rescue_follow_trail", [])
+        candidates = []
+        for index, item in enumerate(trail if isinstance(trail, list) else []):
+            if not isinstance(item, dict) or item.get("player") != player_name:
+                continue
+            dx = abs(pos.x - float(item.get("x", pos.x)))
+            dy = abs(pos.y - float(item.get("y", pos.y)))
+            dz = abs(pos.z - float(item.get("z", pos.z)))
+            distance = dx + dy + dz
+            if distance <= 2 or distance > 24 or dy > 8:
+                continue
+            candidates.append((index, distance, item))
+        if not candidates:
+            return player_pos
+        candidates.sort(key=lambda row: (row[1], -row[0]))
+        item = candidates[0][2]
+        return vec3.Vec3(float(item["x"]), float(item["y"]), float(item["z"]))
+
+    def _follow_rescue_player_step(self):
+        player_name = self._rescue_follow_player_name()
+        if player_name is None:
+            return False
+        player_pos = self._player_position(player_name)
+        if player_pos is None:
+            add_log(
+                title=self.pack_message("Rescue follow target missing."),
+                content="Cannot find player %s to follow out of the cave." % player_name,
+                label="warning",
+            )
+            return False
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is not None:
+            distance = abs(pos.x - player_pos.x) + abs(pos.y - player_pos.y) + abs(pos.z - player_pos.z)
+            if distance <= 2 and self._outside_enough_for_rescue():
+                self.state.pop("rescue_follow_player", None)
+                self.state["rescue_follow_completed_at"] = int(time.time())
+                self.save()
+                self._report("I am with %s in a safer open area now." % player_name)
+                return True
+        self._record_rescue_player_trail(player_name, player_pos)
+        target = self._rescue_follow_target(player_name, player_pos)
+        ok = go_to_position(self.agent, target.x, target.y, target.z, 2)
+        if ok:
+            self._reset_survival_stuck_progress()
+        return ok
 
     def _return_to_base(self):
         base = self._base()
