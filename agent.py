@@ -34,6 +34,8 @@ class Agent(object) :
         self._agent_started_at = time.time()
         self._last_state_sense_at = 0
         self._state_sense_interval = float(self.settings.get("state_sense_interval_seconds", 5))
+        self._last_health = 20.0
+        self._last_damage_guard_at = 0.0
 
         # Request priority queue for handling player messages and self-reflection
         # Priority 1 (HIGH): Player messages - immediate
@@ -535,6 +537,22 @@ class Agent(object) :
                 # Process the message
                 self._process_chat_message(username, message)
 
+        @On(self.bot, "health")
+        def handle_health(*args):
+            try:
+                health = float(self.bot.health or 0)
+            except Exception:
+                return
+            previous = getattr(self, "_last_health", 20.0)
+            self._last_health = health
+            if health <= 0 or health >= previous:
+                return
+            now = time.time()
+            if now - getattr(self, "_last_damage_guard_at", 0.0) < 1.0:
+                return
+            self._last_damage_guard_at = now
+            threading.Thread(target=self._handle_health_drop, args=(previous, health), daemon=True).start()
+
         @On(self.bot, "login")
         def handle_login(*args) :
             skin_path = self.configs.get("skin", {}).get("file", None)
@@ -546,6 +564,37 @@ class Agent(object) :
                     self.memory.save()
                     add_log(title = self.pack_message("Mannual restart is required"), content = "After settting the skin, you need to restart minecraft-ai-python for the AIC to behave as expected.", label = "warning")
 
+
+    def _handle_health_drop(self, previous, health):
+        try:
+            pos = self.bot.entity.position if self.bot and self.bot.entity else None
+            position = "unknown" if pos is None else "(%.1f, %.1f, %.1f)" % (pos.x, pos.y, pos.z)
+            add_log(
+                title=self.pack_message("Health dropped; stopping movement."),
+                content="Health %.1f -> %.1f at %s" % (previous, health, position),
+                label="warning",
+                print=True,
+            )
+            try:
+                if self.bot.pathfinder and self.bot.pathfinder.isMoving():
+                    self.bot.pathfinder.stop()
+            except Exception:
+                pass
+            for control in ["forward", "back", "left", "right", "jump", "sprint", "sneak"]:
+                try:
+                    self.bot.setControlState(control, False)
+                except Exception:
+                    pass
+            plugin = getattr(self, "plugins", {}).get("SurvivalLoop")
+            if plugin is not None:
+                try:
+                    plugin.state["survival_stuck_seconds"] = 0
+                    plugin.state["last_survival_action"] = "recover_from_damage"
+                    plugin.save()
+                except Exception:
+                    pass
+        except Exception as e:
+            add_log(title=self.pack_message("Damage guard failed."), content=str(e), label="warning")
 
     def _install_chat_filter(self):
         """Prepare Python-side chat suppression without replacing the JS bot.chat method."""

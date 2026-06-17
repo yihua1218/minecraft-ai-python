@@ -892,7 +892,15 @@ def craft(agent, item_name, num = 1) :
     required_ingredients = ingredients_from_prismarine_recipe(recipe)
     craft_limit = calculate_limiting_resource(inventory, required_ingredients)
     
-    agent.bot.craft(recipe, min(craft_limit["num"], num), crafting_table)
+    craft_count = min(craft_limit["num"], num)
+    if craft_count <= 0:
+        send_chat(agent, "I don't have enough resources to craft %s." % item_name)
+        return False
+    try:
+        agent.bot.craft(recipe, craft_count, crafting_table, timeout=float(agent.configs.get("craft_timeout_seconds", 45)))
+    except Exception as e:
+        add_log(title=agent.pack_message("Crafting failed."), content="%s: %s" % (item_name, e), label="warning")
+        return False
     if craft_limit["num"] < num : 
         send_chat(agent, "I don't have enough %s to craft %s %s, crafted %s." % (craft_limit["limiting_resource"], num, item_name, craft_limit["num"]))
     else :

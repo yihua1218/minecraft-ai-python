@@ -68,7 +68,7 @@ class PluginInstance(Plugin):
         self.last_tick = 0
         self.tick_interval = int(agent.configs.get("survival_loop_interval_seconds", 25))
         self.enabled = bool(agent.configs.get("survival_loop_enabled", True))
-        self.state = {"base": None, "shelter_blocks_done": [], "farm_origin": None, "farm_blocks_done": [], "farm_failures": 0, "work_cursor": 0}
+        self.state = {"base": None, "shelter_blocks_done": [], "farm_origin": None, "farm_blocks_done": [], "farm_failures": 0, "work_cursor": 0, "pending_tasks": [], "diagnostics": {}}
         self.load()
         self._upgrade_route_strategy_state()
         self._drop_failed_high_tree_routes()
@@ -181,6 +181,195 @@ class PluginInstance(Plugin):
         if self.agent.configs.get("survival_loop_chat_enabled", False):
             chat(self.agent, "", message)
 
+    def _release_movement_controls(self):
+        for control in ["jump", "sneak", "forward", "back", "left", "right", "sprint"]:
+            try:
+                self.agent.bot.setControlState(control, False)
+            except Exception:
+                pass
+
+    def _stop_pathfinder(self):
+        try:
+            pf = getattr(self.agent.bot, "pathfinder", None)
+            if pf is not None:
+                pf.stop()
+        except Exception:
+            pass
+
+    def _recover_stale_motion(self, reason):
+        self._stop_pathfinder()
+        self._release_movement_controls()
+        add_log(title=self.pack_message("Released stale movement controls."), content=reason, label="warning")
+
+    def _task_target_key(self, target):
+        if not isinstance(target, dict):
+            return "none"
+        parts = [str(target.get("kind", "target"))]
+        for name in ["x", "y", "z"]:
+            if name in target:
+                parts.append(str(int(target[name])))
+        return ":".join(parts)
+
+    def _task_key(self, kind, action=None, target=None):
+        return "%s|%s|%s" % (str(kind), str(action or ""), self._task_target_key(target))
+
+    def _pending_tasks(self):
+        tasks = self.state.get("pending_tasks", [])
+        return tasks if isinstance(tasks, list) else []
+
+    def _defer_task(self, kind, action, reason, target=None, cooldown=None):
+        now = time.time()
+        cooldown = float(cooldown if cooldown is not None else self.agent.configs.get("pending_task_retry_seconds", 300))
+        key = self._task_key(kind, action, target)
+        tasks = []
+        updated = False
+        for item in self._pending_tasks():
+            if not isinstance(item, dict):
+                continue
+            if item.get("key") == key:
+                attempts = int(item.get("attempts", 0) or 0) + 1
+                item.update({
+                    "kind": kind,
+                    "action": action,
+                    "reason": reason,
+                    "target": target,
+                    "attempts": attempts,
+                    "last_failed_at": now,
+                    "next_retry_at": now + cooldown * min(attempts, 4),
+                })
+                updated = True
+            tasks.append(item)
+        if not updated:
+            tasks.append({
+                "key": key,
+                "kind": kind,
+                "action": action,
+                "reason": reason,
+                "target": target,
+                "attempts": 1,
+                "created_at": now,
+                "last_failed_at": now,
+                "next_retry_at": now + cooldown,
+            })
+        tasks.sort(key=lambda item: (float(item.get("next_retry_at", 0) or 0), float(item.get("created_at", now) or now)))
+        self.state["pending_tasks"] = tasks[: int(self.agent.configs.get("pending_task_limit", 40))]
+        self.save()
+        add_log(title=self.pack_message("Deferred survival task."), content="%s %s: %s" % (kind, action, reason), label="warning")
+
+    def _complete_pending_task(self, kind, action=None, target=None):
+        key = self._task_key(kind, action, target)
+        tasks = self._pending_tasks()
+        kept = [item for item in tasks if isinstance(item, dict) and item.get("key") != key]
+        if len(kept) != len(tasks):
+            self.state["pending_tasks"] = kept
+            self.save()
+
+    def _resource_target_key(self, target):
+        if not isinstance(target, dict):
+            return None
+        try:
+            return "%s:%d,%d" % (target.get("kind", "resource"), int(target["x"]), int(target["z"]))
+        except Exception:
+            return None
+
+    def _revive_pending_target(self, task):
+        target = task.get("target") if isinstance(task, dict) else None
+        if not isinstance(target, dict):
+            return
+        resource_key = self._resource_target_key(target)
+        if resource_key is not None:
+            blocked = set(self.state.get("unreachable_resource_targets", []))
+            if resource_key in blocked:
+                blocked.remove(resource_key)
+                self.state["unreachable_resource_targets"] = sorted(blocked)
+            failures = dict(self.state.get("resource_path_plan_failures", {}) or {})
+            if resource_key in failures:
+                failures.pop(resource_key, None)
+                self.state["resource_path_plan_failures"] = failures
+        if all(name in target for name in ["x", "y", "z"]):
+            self._mark_build_success(target["x"], target["y"], target["z"])
+
+    def _pending_attempts(self, kind, action=None):
+        total = 0
+        for item in self._pending_tasks():
+            if not isinstance(item, dict):
+                continue
+            if item.get("kind") != kind:
+                continue
+            if action is not None and item.get("action") != action:
+                continue
+            total += int(item.get("attempts", 0) or 0)
+        return total
+
+    def _tree_search_backoff_active(self):
+        diagnostics = dict(self.state.get("diagnostics", {}) or {})
+        last_issue = diagnostics.get("last_issue", {}) if isinstance(diagnostics.get("last_issue", {}), dict) else {}
+        recent = last_issue.get("action") == "find_trees" and time.time() - float(last_issue.get("t", 0) or 0) < float(self.agent.configs.get("tree_search_backoff_seconds", 600))
+        unreachable = self.state.get("unreachable_resource_targets", [])
+        tree_search_blocked = len([item for item in unreachable if str(item).startswith("tree_search:")]) >= 2 if isinstance(unreachable, list) else False
+        return recent or tree_search_blocked or self._pending_attempts("stuck_action", "find_trees") >= 1 or self._pending_attempts("tree_search", "find_trees") >= 1
+
+    def _dirt_collection_backoff_active(self):
+        diagnostics = dict(self.state.get("diagnostics", {}) or {})
+        last_issue = diagnostics.get("last_issue", {}) if isinstance(diagnostics.get("last_issue", {}), dict) else {}
+        recent = last_issue.get("action") == "collect_dirt" and time.time() - float(last_issue.get("t", 0) or 0) < float(self.agent.configs.get("dirt_collection_backoff_seconds", 900))
+        return recent or int(self.state.get("dirt_stockpile_failures", 0) or 0) >= 2
+
+    def _pending_task_ready(self, task, inv):
+        if not isinstance(task, dict):
+            return False
+        if time.time() < float(task.get("next_retry_at", 0) or 0):
+            return False
+        target = task.get("target") if isinstance(task.get("target"), dict) else None
+        kind = task.get("kind")
+        action = task.get("action")
+        if kind == "stuck_action":
+            return False
+        if action == "find_trees" and self._tree_search_backoff_active():
+            return False
+        if kind == "tree_high_wait_fall_safety" and not self._fall_safety_available():
+            return False
+        if action in ["build_resource_path", "prepare_farm_plot", "build_cliff_path"]:
+            if inv.get("dirt", 0) + inv.get("grass_block", 0) < 1:
+                return False
+        if action == "collect_stone" and inv.get("wooden_pickaxe", 0) < 1 and inv.get("stone_pickaxe", 0) < 1:
+            return False
+        if kind == "farm_tile" and target is not None:
+            return self._is_farm_tile_level_with_water(int(target["x"]), int(target["y"]), int(target["z"]))
+        if kind == "collect_logs" and self._best_log_block() is None:
+            return False
+        return action in set([
+            "build_resource_path", "collect_logs", "find_trees", "collect_stone",
+            "prepare_farm_plot", "build_cliff_path", "farm", "collect_dirt", "return_base",
+            "build_shelter", "plant_saplings", "collect_seeds", "craft_planks", "craft_table",
+            "craft_chest", "place_storage_chest", "deposit_items", "craft_wooden_pickaxe",
+            "craft_wooden_tools", "craft_stone_tools", "find_riverbank",
+        ])
+
+    def _next_pending_action(self, inv):
+        if float(self.state.get("survival_stuck_seconds", 0) or 0) > 0:
+            return None
+        for task in self._pending_tasks():
+            if not self._pending_task_ready(task, inv):
+                continue
+            action = task.get("action")
+            self._revive_pending_target(task)
+            self._complete_pending_task(task.get("kind"), action, task.get("target"))
+            add_log(title=self.pack_message("Resuming deferred survival task."), content="%s: %s" % (action, task.get("reason", "retry")), label="plugin")
+            return action
+        return None
+
+    def _record_self_diagnosis(self, action, reason, target=None):
+        now = time.time()
+        diagnostics = dict(self.state.get("diagnostics", {}) or {})
+        diagnostics["last_issue"] = {"action": action, "reason": reason, "target": target, "t": now}
+        diagnostics["issue_count"] = int(diagnostics.get("issue_count", 0) or 0) + 1
+        self.state["diagnostics"] = diagnostics
+        if action:
+            self._defer_task("stuck_action", action, reason, target=target, cooldown=self.agent.configs.get("stuck_task_retry_seconds", 420))
+        else:
+            self.save()
+
     def survival_tick(self):
         if not self.enabled:
             return False
@@ -201,6 +390,8 @@ class PluginInstance(Plugin):
             self._update_survival_stuck_state()
             inv = get_item_counts(self.agent)
             action = self._choose_step(inv)
+            if action == "collect_dirt" and self._dirt_collection_backoff_active():
+                action = "relocate_from_stuck" if self._inside_base_safe_radius() else "return_base"
             self.state["last_survival_action"] = action
             self.save()
             add_log(title=self.pack_message("Survival loop step."), content=action, label="plugin")
@@ -211,6 +402,10 @@ class PluginInstance(Plugin):
                 return self._escape_cave_step()
             if action == "escape_stuck":
                 return self._escape_stuck_step()
+            if action == "relocate_from_stuck":
+                return self._relocate_from_stuck_step()
+            if action == "stabilize_position":
+                return self._stabilize_position_step()
             if action == "build_cliff_path":
                 return self._build_cliff_path_step()
             if action == "plant_saplings":
@@ -259,7 +454,34 @@ class PluginInstance(Plugin):
             add_log(title=self.pack_message("Survival loop failed."), content=str(e), label="warning")
             return False
 
+    def _movement_backoff_active(self):
+        return int(self.state.get("movement_backoff_steps", 0) or 0) > 0
+
+    def _enter_movement_backoff(self, reason, seconds=None):
+        steps = int(self.agent.configs.get("movement_backoff_steps", 60))
+        self.state["movement_backoff_steps"] = max(int(self.state.get("movement_backoff_steps", 0) or 0), steps)
+        self.state["movement_backoff_until"] = 0
+        self.state["consecutive_relocations"] = 0
+        self.state["survival_stuck_seconds"] = 0
+        self.state["last_survival_action"] = None
+        self.state["tree_search_move_failures"] = 0
+        self.state.pop("tree_search_target", None)
+        self.save()
+        self._recover_stale_motion(reason)
+        add_log(title=self.pack_message("Movement backoff enabled."), content=reason, label="warning")
+
+    def _stabilize_position_step(self):
+        self._recover_stale_motion("Stabilizing after repeated movement failures; no movement task will run during backoff.")
+        steps = max(0, int(self.state.get("movement_backoff_steps", 0) or 0) - 1)
+        self.state["movement_backoff_steps"] = steps
+        self.state["survival_stuck_seconds"] = 0
+        self.state["last_survival_action"] = None
+        self.save()
+        return True
+
     def _choose_step(self, inv):
+        if self._movement_backoff_active():
+            return "stabilize_position"
         logs = self._count_logs(inv)
         planks = self._count_planks(inv)
         seeds = inv.get("wheat_seeds", 0)
@@ -272,9 +494,30 @@ class PluginInstance(Plugin):
         if self._should_follow_rescue_player():
             return "follow_rescue_player"
         if self._is_survival_stuck():
+            last_action = self.state.get("last_survival_action")
+            reason = "Survival step looked stuck after %s." % (last_action or "unknown action")
+            self._recover_stale_motion(reason)
+            self._record_self_diagnosis(last_action, reason)
+            if last_action in ["return_base", "relocate_from_stuck", "collect_dirt", "build_resource_path"]:
+                self._enter_movement_backoff(reason)
+                return "stabilize_position"
+            if last_action == "find_trees":
+                self._advance_tree_search_target()
+                self._reset_survival_stuck_progress()
+                return "relocate_from_stuck"
             return "escape_stuck"
+        if int(self.state.get("tree_search_move_failures", 0) or 0) > 0:
+            reason = "Tree search movement failed; relocating before trying another target."
+            self._recover_stale_motion(reason)
+            self._defer_task("tree_search", "find_trees", reason, target=self.state.get("tree_search_target"), cooldown=240)
+            self._reset_survival_stuck_progress()
+            return "relocate_from_stuck" if self._inside_base_safe_radius() else "return_base"
         if logs < 1 and planks < 6 and self._best_log_block() is None:
             self._remember_visible_trees(force=True)
+            if self._tree_search_backoff_active():
+                if int(self.state.get("dirt_stockpile_failures", 0) or 0) < 2 and inv.get("dirt", 0) + inv.get("grass_block", 0) < 32:
+                    return "collect_dirt"
+                return "relocate_from_stuck" if self._inside_base_safe_radius() else "return_base"
             high_tree = self._nearest_high_remembered_tree()
             if high_tree is not None:
                 if self._completed_high_tree_route(high_tree) is not None:
@@ -286,11 +529,20 @@ class PluginInstance(Plugin):
             return "escape_cave"
         if self._should_plant_saplings(inv):
             return "plant_saplings"
+        if self._should_return_to_base():
+            return "return_base"
+        pending_action = self._next_pending_action(inv)
+        if pending_action is not None:
+            return pending_action
         if self._needs_basic_wooden_tools(inv):
             if logs < 1 and planks < 6:
                 block = self._best_log_block()
                 if block is None:
                     self._remember_visible_trees(force=True)
+                    if self._tree_search_backoff_active():
+                        if inv.get("dirt", 0) + inv.get("grass_block", 0) < 32:
+                            return "collect_dirt"
+                        return "relocate_from_stuck" if self._inside_base_safe_radius() else "return_base"
                     high_tree = self._nearest_high_remembered_tree()
                     if high_tree is not None and not self._is_unreachable_resource_target(high_tree):
                         if self._completed_high_tree_route(high_tree) is not None:
@@ -314,8 +566,6 @@ class PluginInstance(Plugin):
             if inv.get("stick", 0) < 4 and planks >= 2:
                 return "craft_wooden_tools"
             return "craft_wooden_tools"
-        if self._should_return_to_base():
-            return "return_base"
         if self.state.get("farm_mode") == "riverbank" and not self._has_riverbank_farm_plan():
             return "find_riverbank"
         if self.state.get("farm_mode") == "riverbank" and self._has_riverbank_farm_plan():
@@ -411,6 +661,9 @@ class PluginInstance(Plugin):
         dy = pos.y - base["y"]
         dz = pos.z - base["z"]
         max_distance = 56 if self.state.get("farm_mode") == "riverbank" else 24
+        inv = get_item_counts(self.agent)
+        if self._needs_basic_wooden_tools(inv) and self._count_logs(inv) < 1 and self._count_planks(inv) < 6:
+            max_distance = min(max_distance, int(self.agent.configs.get("tree_search_max_distance_from_base", 18)))
         return abs(dy) > 12 or math.sqrt(dx * dx + dz * dz) > max_distance
 
     def _should_collect_more_dirt_before_resource_path(self, inv):
@@ -550,9 +803,111 @@ class PluginInstance(Plugin):
             self._reset_survival_stuck_progress()
         return ok
 
+    def _inside_base_safe_radius(self):
+        base = self._base()
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is None:
+            return False
+        horizontal = abs(pos.x - base["x"]) + abs(pos.z - base["z"])
+        vertical = abs(pos.y - base["y"])
+        return horizontal <= int(self.agent.configs.get("base_safe_radius", 14)) and vertical <= int(self.agent.configs.get("base_safe_vertical_tolerance", 8))
+
+    def _relocation_candidates(self):
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is None:
+            return []
+        x, y, z = math.floor(pos.x), math.floor(pos.y), math.floor(pos.z)
+        candidates = []
+        offsets = [(2, 0), (-2, 0), (0, 2), (0, -2), (3, 1), (-3, 1), (1, 3), (1, -3), (4, 0), (0, 4), (-4, 0), (0, -4)]
+        empty = set(get_empty_block_names())
+        for dx, dz in offsets:
+            tx, tz = x + dx, z + dz
+            for ty in [y, y + 1, y - 1]:
+                feet = self._block_name_at(tx, ty, tz)
+                head = self._block_name_at(tx, ty + 1, tz)
+                ground = self._block_name_at(tx, ty - 1, tz)
+                if feet is not None and feet not in empty:
+                    continue
+                if head is not None and head not in empty:
+                    continue
+                if ground is None or ground in empty or ground in self._liquid_block_names() or ground in self._farm_danger_blocks():
+                    continue
+                candidates.append((abs(dx) + abs(dz) + abs(ty - y), tx, ty, tz))
+                break
+        candidates.sort(key=lambda item: item[0])
+        return [(x, y, z) for _, x, y, z in candidates]
+
+    def _distance_from(self, start):
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is None or start is None:
+            return 0
+        dx = float(pos.x) - float(start.x)
+        dz = float(pos.z) - float(start.z)
+        return math.sqrt(dx * dx + dz * dz)
+
+    def _manual_relocation_nudge(self, x, y, z):
+        try:
+            self.agent.bot.lookAt(vec3.Vec3(float(x) + 0.5, float(y) + 0.8, float(z) + 0.5))
+        except Exception:
+            pass
+        try:
+            self.agent.bot.setControlState("forward", True)
+            self.agent.bot.setControlState("sprint", True)
+            self.agent.bot.setControlState("jump", True)
+            time.sleep(0.9)
+        finally:
+            self._release_movement_controls()
+        time.sleep(0.2)
+
+    def _finish_relocation_success(self):
+        self.state["survival_stuck_seconds"] = 0
+        self.state["last_survival_action"] = None
+        self.state["tree_search_move_failures"] = 0
+        self.state["consecutive_relocations"] = int(self.state.get("consecutive_relocations", 0) or 0) + 1
+        self.state.pop("tree_search_target", None)
+        self._reset_survival_stuck_progress()
+        self.save()
+        self._report("I moved to a nearby safe spot to break out of the stuck loop.", label="warning")
+        if int(self.state.get("consecutive_relocations", 0) or 0) >= int(self.agent.configs.get("max_consecutive_relocations", 3)):
+            self._enter_movement_backoff("Repeated relocation succeeded but no productive task followed; pausing movement tasks.")
+        return True
+
+    def _relocate_from_stuck_step(self):
+        self._recover_stale_motion("Relocating to a nearby safe standing position after repeated stalled movement.")
+        start = get_entity_position(self.agent.bot.entity)
+        for x, y, z in self._relocation_candidates():
+            ok = go_to_position(self.agent, x, y, z, 1)
+            if ok and self._distance_from(start) >= 1.0:
+                return self._finish_relocation_success()
+            self._manual_relocation_nudge(x, y, z)
+            if self._distance_from(start) >= 1.0:
+                return self._finish_relocation_success()
+        return self._escape_stuck_step()
+
     def _return_to_base(self):
         base = self._base()
-        return go_to_position(self.agent, base["x"], base["y"], base["z"], 4)
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is not None:
+            horizontal = abs(pos.x - base["x"]) + abs(pos.z - base["z"])
+            vertical = abs(pos.y - base["y"])
+            if horizontal <= int(self.agent.configs.get("base_safe_radius", 14)) and vertical <= int(self.agent.configs.get("base_safe_vertical_tolerance", 8)):
+                recent_issue = (self.state.get("diagnostics", {}) or {}).get("last_issue", {})
+                if recent_issue.get("action") == "find_trees" and time.time() - float(recent_issue.get("t", 0) or 0) < 300:
+                    return self._relocate_from_stuck_step()
+                self._recover_stale_motion("Bot is already inside the safe base radius; clearing any stale pathfinder or jump controls.")
+                self.state["tree_search_move_failures"] = 0
+                self.state.pop("tree_search_target", None)
+                self._reset_survival_stuck_progress()
+                self.save()
+                self._report("I am back inside the safe base radius.")
+                return True
+        ok = go_to_position(self.agent, base["x"], base["y"], base["z"], int(self.agent.configs.get("return_base_closeness", 8)))
+        if ok:
+            self.state["tree_search_move_failures"] = 0
+            self.state.pop("tree_search_target", None)
+            self._reset_survival_stuck_progress()
+            self.save()
+        return ok
 
     def _walkable_ground_names(self):
         return set([
@@ -719,6 +1074,7 @@ class PluginInstance(Plugin):
                 content="%s after %d failures at %s" % (reason, failures[key], key),
                 label="warning",
             )
+            self._defer_task("build_position", "build_resource_path", reason, target={"kind": "build_position", "x": int(x), "y": int(y), "z": int(z)}, cooldown=360)
         self.save()
 
     def _has_build_support(self, x, y, z):
@@ -867,13 +1223,16 @@ class PluginInstance(Plugin):
 
     def _is_survival_stuck(self):
         threshold = float(self.agent.configs.get("survival_emergency_stuck_seconds", 18))
-        if self.state.get("last_survival_action") == "build_resource_path":
-            threshold = max(threshold, 75.0)
+        action = self.state.get("last_survival_action")
+        if action == "build_resource_path":
+            threshold = max(threshold, float(self.agent.configs.get("resource_path_stuck_seconds", 45)))
             progress_at = float(self.state.get("last_resource_path_progress_at", 0) or 0)
-            if time.time() - progress_at < 180:
-                threshold = max(threshold, 120.0)
-        if self.state.get("last_survival_action") == "collect_logs":
-            threshold = max(threshold, 90.0)
+            if time.time() - progress_at < 120:
+                threshold = max(threshold, float(self.agent.configs.get("resource_path_progress_stuck_seconds", 60)))
+        if action == "collect_logs":
+            threshold = max(threshold, float(self.agent.configs.get("log_collection_stuck_seconds", 35)))
+        if action == "find_trees":
+            threshold = max(threshold, float(self.agent.configs.get("tree_search_stuck_seconds", 25)))
         return float(self.state.get("survival_stuck_seconds", 0) or 0) >= threshold
 
     def _escape_stuck_candidates(self):
@@ -1072,6 +1431,7 @@ class PluginInstance(Plugin):
                 pass
 
     def _escape_stuck_step(self):
+        self._recover_stale_motion("Starting emergency unstuck step with clean movement controls.")
         for block in self._escape_stuck_candidates():
             if not self._can_safely_dig_block(block, "emergency unstuck digging", emergency=True):
                 continue
@@ -1315,6 +1675,20 @@ class PluginInstance(Plugin):
     def _resource_tree_scan_interval_seconds(self):
         return float(self.agent.configs.get("resource_tree_scan_interval_seconds", 180))
 
+    def _fall_safety_available(self):
+        inv = get_item_counts(self.agent)
+        modes = self.agent.configs.get("modes", {}) or {}
+        bucket_clutch = bool(modes.get("high_jump", False)) and (
+            inv.get("water_bucket", 0) > 0 or inv.get("powder_snow_bucket", 0) > 0
+        )
+        return bucket_clutch or inv.get("hay_block", 0) > 0 or inv.get("slime_block", 0) > 0
+
+    def _high_tree_max_climb(self):
+        if self._fall_safety_available():
+            return int(self.agent.configs.get("resource_high_tree_max_climb_with_fall_safety", 22))
+        return int(self.agent.configs.get("resource_high_tree_max_climb_without_fall_safety", 7))
+
+
     def _remember_visible_trees(self, force=False):
         known = self.state.get("known_resource_trees", [])
         now = time.time()
@@ -1375,11 +1749,16 @@ class PluginInstance(Plugin):
         return valid[0]
 
     def _nearest_high_remembered_tree(self):
+        if not bool(self.agent.configs.get("resource_high_tree_enabled", True)):
+            return None
         trees = self.state.get("known_resource_trees", [])
         pos = get_entity_position(self.agent.bot.entity)
         if pos is None or not isinstance(trees, list):
             return None
+        base = self._base()
         ox, oy, oz = math.floor(pos.x), math.floor(pos.y), math.floor(pos.z)
+        max_climb = self._high_tree_max_climb()
+        max_base_distance = int(self.agent.configs.get("resource_high_tree_max_base_distance", 48))
         candidates = []
         for item in trees:
             if not isinstance(item, dict):
@@ -1388,9 +1767,14 @@ class PluginInstance(Plugin):
             name = item.get("name", "")
             if not (name.endswith("_log") or name.endswith("_stem") or name == "bamboo_block"):
                 continue
-            if y - oy < 9:
+            climb = y - oy
+            if climb < 9:
+                continue
+            if climb > max_climb:
                 continue
             if abs(x - ox) + abs(z - oz) > self._resource_route_scan_radius():
+                continue
+            if abs(x - int(base["x"])) + abs(z - int(base["z"])) > max_base_distance:
                 continue
             if self._high_tree_failure_count(x, z) >= 5:
                 continue
@@ -1870,6 +2254,9 @@ class PluginInstance(Plugin):
         blocked.add(key)
         self.state["unreachable_resource_targets"] = sorted(blocked)
         self.save()
+        action = "build_resource_path"
+        kind = "tree_high_wait_fall_safety" if target.get("kind") == "tree_high" and not self._fall_safety_available() else "resource_path"
+        self._defer_task(kind, action, "resource route is currently unreachable", target=target, cooldown=600)
         add_log(title=self.pack_message("Resource route unreachable."), content=key, label="warning")
 
     def _is_unreachable_resource_target(self, target):
@@ -1884,6 +2271,8 @@ class PluginInstance(Plugin):
     def _move_to_resource_step(self, x, y, z, mode="walk", distance=1):
         pos = get_entity_position(self.agent.bot.entity)
         jump = mode in ["jump", "jump_hard"] or (pos is not None and int(y) >= math.floor(pos.y))
+        if jump:
+            distance = max(distance, 2)
         try:
             if jump:
                 self.agent.bot.setControlState("jump", True)
@@ -2143,7 +2532,8 @@ class PluginInstance(Plugin):
         directions = [(1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)]
         idx = int(self.state.get("tree_search_direction", 0) or 0) % len(directions)
         dx, dz = directions[idx]
-        target = {"x": base["x"] + dx * 48, "y": base["y"], "z": base["z"] + dz * 48}
+        radius = int(self.agent.configs.get("tree_search_radius", 16))
+        target = {"x": base["x"] + dx * radius, "y": base["y"], "z": base["z"] + dz * radius}
         self.state["tree_search_target"] = target
         self.save()
         return {"kind": "tree_search", "x": target["x"], "y": target["y"], "z": target["z"]}
@@ -2151,9 +2541,27 @@ class PluginInstance(Plugin):
     def _advance_tree_search_target(self):
         self.state["tree_search_direction"] = int(self.state.get("tree_search_direction", 0) or 0) + 1
         self.state.pop("tree_search_target", None)
+        self.state["tree_search_move_failures"] = 0
         self.save()
 
+    def _tree_search_move_failed(self, target, reason):
+        self._recover_stale_motion("Tree search movement failed; clearing pathfinder and jump before recovery.")
+        failures = int(self.state.get("tree_search_move_failures", 0) or 0) + 1
+        self.state["tree_search_move_failures"] = failures
+        self.save()
+        add_log(
+            title=self.pack_message("Tree search movement failed."),
+            content="%s toward (%d, %d, %d); failure %d" % (reason, int(target["x"]), int(target["y"]), int(target["z"]), failures),
+            label="warning",
+        )
+        if failures >= int(self.agent.configs.get("tree_search_max_move_failures", 2)):
+            self._advance_tree_search_target()
+            self._report("I could not safely reach that tree search point, so I will try a closer direction instead.", label="warning")
+        return False
+
     def _needs_tree_search(self, inv):
+        if self._tree_search_backoff_active():
+            return False
         if not self._needs_basic_wooden_tools(inv):
             return False
         if self._count_logs(inv) > 0 or self._count_planks(inv) >= 6:
@@ -2199,19 +2607,24 @@ class PluginInstance(Plugin):
                         index = plan.index(step)
                         reached = abs(x - int(target["x"])) + abs(z - int(target["z"])) <= 2
                         self._remember_successful_resource_route(target, plan[:index + 1], reached=reached)
+                    else:
+                        return self._tree_search_move_failed(target, "route step movement did not arrive")
                     break
                 return self._build_resource_path_step()
         else:
             ok = go_to_position(self.agent, target["x"], target["y"], target["z"], 8)
+            if not ok:
+                return self._tree_search_move_failed(target, "direct movement did not arrive")
         block = self._best_log_block()
         if block is not None:
             self.state.pop("tree_search_target", None)
+            self.state["tree_search_move_failures"] = 0
             self.save()
             self._report("I found trees near the resource path and will collect logs.")
             return True
         self._advance_tree_search_target()
         self._report("I reached a tree search point but still found no logs; I will try another direction.", label="warning")
-        return ok
+        return True
 
     def _count_logs(self, inv):
         return sum(count for name, count in inv.items() if name.endswith("_log") or name.endswith("_stem") or name == "bamboo_block")
@@ -2517,7 +2930,14 @@ class PluginInstance(Plugin):
             self._remember_visible_trees(force=True)
             block = self._best_log_block()
         if block is None:
+            self._defer_task("collect_logs", "find_trees", "nearby logs are not visible yet", cooldown=300)
             self._report("I cannot find nearby logs, so I will stay near spawn and try again later.", label="warning")
+            return False
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is not None and int(block.position.y) - math.floor(pos.y) > self._high_tree_max_climb():
+            target = {"kind": "tree_high", "x": int(block.position.x), "y": int(block.position.y), "z": int(block.position.z)}
+            self._mark_unreachable_resource_target(target)
+            self._report("I found logs above me, but I am skipping that high tree until I have safer fall protection.", label="warning")
             return False
         before = get_item_counts(self.agent).get(block.name, 0)
         replant_site = self._remember_tree_replant_site(block)
@@ -2577,6 +2997,37 @@ class PluginInstance(Plugin):
             pass
         return True
 
+    def _go_to_position_limited(self, x, y, z, closeness, timeout=3):
+        old_move = self.agent.configs.get("movement_timeout_seconds")
+        old_build = self.agent.configs.get("movement_build_timeout_seconds")
+        self.agent.configs["movement_timeout_seconds"] = timeout
+        self.agent.configs["movement_build_timeout_seconds"] = timeout
+        try:
+            return go_to_position(self.agent, x, y, z, closeness)
+        finally:
+            if old_move is None:
+                self.agent.configs.pop("movement_timeout_seconds", None)
+            else:
+                self.agent.configs["movement_timeout_seconds"] = old_move
+            if old_build is None:
+                self.agent.configs.pop("movement_build_timeout_seconds", None)
+            else:
+                self.agent.configs["movement_build_timeout_seconds"] = old_build
+            self._recover_stale_motion("Finished limited movement attempt; clearing controls before continuing.")
+
+    def _dirt_candidate_score(self, block):
+        pos = get_entity_position(self.agent.bot.entity)
+        if pos is None:
+            return 0
+        dx = int(block.position.x) - math.floor(pos.x)
+        dy = int(block.position.y) - math.floor(pos.y)
+        dz = int(block.position.z) - math.floor(pos.z)
+        if abs(dy) > 1:
+            return None
+        if dx * dx + dz * dz > 25:
+            return None
+        return dx * dx + dz * dz + abs(dy) * 8
+
     def _collect_dirt_stockpile(self):
         inv = get_item_counts(self.agent)
         have = inv.get("dirt", 0) + inv.get("grass_block", 0)
@@ -2584,8 +3035,17 @@ class PluginInstance(Plugin):
         if have >= target:
             self._report("I have enough dirt for farm platforms for now.")
             return True
-        blocks = get_nearest_blocks(self.agent, ["dirt", "grass_block"], 32, 32)
-        blocks = [block for block in blocks if self._safe_dirt_block(block)]
+        blocks = get_nearest_blocks(self.agent, ["dirt", "grass_block"], 8, 12)
+        scored = []
+        for block in blocks:
+            if not self._safe_dirt_block(block):
+                continue
+            score = self._dirt_candidate_score(block)
+            if score is None:
+                continue
+            scored.append((score, block))
+        scored.sort(key=lambda item: item[0])
+        blocks = [block for _, block in scored]
         if not blocks:
             self.state["dirt_stockpile_failures"] = int(self.state.get("dirt_stockpile_failures", 0) or 0) + 1
             self.save()
@@ -2596,20 +3056,25 @@ class PluginInstance(Plugin):
             )
             return self._return_to_base()
         collected = 0
-        for block in blocks[: min(8, target - have)]:
+        for block in blocks[: min(1, target - have)]:
             try:
-                go_to_position(self.agent, block.position.x, block.position.y + 1, block.position.z, 3)
+                if not self._go_to_position_limited(block.position.x, block.position.y + 1, block.position.z, 3, timeout=3):
+                    self._mark_build_failure(block.position.x, block.position.y, block.position.z, "dirt stockpile approach failed", limit=1)
+                    continue
                 pos = get_entity_position(self.agent.bot.entity)
-                if pos is None or abs(pos.x - block.position.x) + abs(pos.y - (block.position.y + 1)) + abs(pos.z - block.position.z) > 6:
+                if pos is None or abs(pos.x - block.position.x) + abs(pos.y - (block.position.y + 1)) + abs(pos.z - block.position.z) > 5:
+                    self._recover_stale_motion("Dirt approach ended too far from target; clearing controls.")
                     continue
                 block = self.agent.bot.blockAt(block.position)
                 if block is None or not self._safe_dirt_block(block):
                     continue
-                self.agent.bot.dig(block, timeout=30)
+                self.agent.bot.dig(block, timeout=6)
                 time.sleep(0.3)
-                pickup_nearby_items(self.agent, 6, 8)
+                pickup_nearby_items(self.agent, 6, 4)
+                self._recover_stale_motion("Dirt stockpile dig attempt finished; clearing controls.")
                 collected += 1
             except Exception as e:
+                self._recover_stale_motion("Dirt stockpile dig failed; clearing controls.")
                 add_log(title=self.pack_message("Dirt stockpile dig failed."), content=str(e), label="warning")
                 continue
         after = get_item_counts(self.agent)
@@ -2712,21 +3177,25 @@ class PluginInstance(Plugin):
         if not positions:
             self._report("I have saplings, but I cannot find a safely spaced planting spot yet.", label="warning")
             return False
-        x, y, z = positions[0]
-        if not self._can_place_supported(x, y, z, "sapling placement"):
-            return False
-        ok = place_block(self.agent, sapling_name, x, y, z, "bottom", True)
-        verified = self._block_name_at(x, y, z)
-        if ok or verified == sapling_name:
-            self._mark_build_success(x, y, z)
-            planted = set(self.state.get("saplings_planted", []))
-            planted.add("%d,%d,%d" % (x, y - 1, z))
-            self.state["saplings_planted"] = sorted(planted)
-            self._clear_replant_site(x, y - 1, z)
-            self.save()
-            self._report("I planted %s so the forest can regrow sustainably." % sapling_name)
-            return True
-        self._mark_build_failure(x, y, z, "sapling placement failed")
+        for x, y, z in positions[:4]:
+            if not self._can_place_supported(x, y, z, "sapling placement"):
+                continue
+            if not self._go_to_position_limited(x, y, z, 4, timeout=6):
+                self._mark_build_failure(x, y, z, "sapling approach failed", limit=1)
+                continue
+            ok = place_block(self.agent, sapling_name, x, y, z, "bottom", True)
+            self._recover_stale_motion("Sapling placement attempt finished; clearing controls.")
+            verified = self._block_name_at(x, y, z)
+            if ok or verified == sapling_name:
+                self._mark_build_success(x, y, z)
+                planted = set(self.state.get("saplings_planted", []))
+                planted.add("%d,%d,%d" % (x, y - 1, z))
+                self.state["saplings_planted"] = sorted(planted)
+                self._clear_replant_site(x, y - 1, z)
+                self.save()
+                self._report("I planted %s so the forest can regrow sustainably." % sapling_name)
+                return True
+            self._mark_build_failure(x, y, z, "sapling placement failed")
         return False
 
     def _craft_planks(self):
@@ -2803,6 +3272,7 @@ class PluginInstance(Plugin):
         before = inv.get("cobblestone", 0)
         blocks = get_nearest_blocks(self.agent, ["stone", "deepslate"], 32, 12)
         if not blocks:
+            self._defer_task("collect_stone", "collect_stone", "exposed stone is not visible nearby", cooldown=420)
             self._report("I cannot find exposed stone nearby, so I will keep improving the farm and shelter.", label="warning")
             return False
         block = blocks[0]
@@ -3117,14 +3587,30 @@ class PluginInstance(Plugin):
                     return True
         return False
 
+    def _farm_water_level_at(self, x, y, z, radius=4, exclude=None):
+        exclude = exclude or set()
+        for dx in range(-radius, radius + 1):
+            for dz in range(-radius, radius + 1):
+                if max(abs(dx), abs(dz)) > radius:
+                    continue
+                key = "%d,%d,%d" % (x + dx, y, z + dz)
+                if key in exclude:
+                    continue
+                if self._block_name_at(x + dx, y, z + dz) in ["water", "flowing_water"]:
+                    return y
+        return None
+
+    def _is_farm_tile_level_with_water(self, x, y, z):
+        return self._farm_water_level_at(x, y, z, 4, exclude=set(["%d,%d,%d" % (x, y, z)])) is not None
+
     def _is_hydrated_farm_tile(self, x, y, z):
-        return self._is_water_near(x, y, z, 4)
+        return self._is_farm_tile_level_with_water(x, y, z)
 
     def _farm_daylight_scan_height(self):
         return int(self.agent.configs.get("farm_daylight_scan_height", 18))
 
     def _farm_max_water_level_delta(self):
-        return int(self.agent.configs.get("farm_max_water_level_delta", 3))
+        return 0
 
     def _farm_min_sky_light(self):
         return int(self.agent.configs.get("farm_min_sky_light", 12))
@@ -3226,7 +3712,7 @@ class PluginInstance(Plugin):
             return False
         if not self._solid_farm_base(self._block_name_at(x, y - 1, z)):
             return False
-        return self._is_water_near(x, y, z, 4, exclude=set(["%d,%d,%d" % (x, y, z)]))
+        return self._is_farm_tile_level_with_water(x, y, z)
 
     def _can_place_farm_dirt(self, x, y, z):
         if self._is_shallow_farm_water(x, y, z):
@@ -3318,6 +3804,8 @@ class PluginInstance(Plugin):
         return cost
 
     def _riverbank_farm_score(self, x, y, z, base, target_y):
+        if not self._is_farm_tile_level_with_water(x, y, z):
+            return None
         if abs(y - target_y) > self._farm_max_water_level_delta():
             return None
         level_cost = self._farm_leveling_cost(x, y, z)
@@ -3427,7 +3915,6 @@ class PluginInstance(Plugin):
         base = self._base()
         if not water_blocks:
             return []
-        preferred_y = self._riverbank_search_target()["y"] - 1
         candidates = []
         seen = set()
         for water in water_blocks:
@@ -3443,7 +3930,7 @@ class PluginInstance(Plugin):
                     seen.add(key)
                     if self._is_abandoned_farm_position(x, y, z):
                         continue
-                    score = self._riverbank_farm_score(x, y, z, base, preferred_y)
+                    score = self._riverbank_farm_score(x, y, z, base, wy)
                     if score is None:
                         continue
                     candidates.append((score, x, y, z))
@@ -3538,6 +4025,7 @@ class PluginInstance(Plugin):
         abandoned = dict(self.state.get("abandoned_farm_positions", {}) or {})
         abandoned[key] = {"reason": reason, "t": time.time()}
         self.state["abandoned_farm_positions"] = abandoned
+        self._defer_task("farm_tile", "prepare_farm_plot", reason, target={"kind": "farm_tile", "x": int(x), "y": int(y), "z": int(z)}, cooldown=900)
         self.save()
         add_log(
             title=self.pack_message("Abandoned farm position."),
@@ -3563,6 +4051,7 @@ class PluginInstance(Plugin):
         for x, y, z in self._farm_positions():
             key = "%d,%d,%d" % (x, y, z)
             if not self._is_hydrated_farm_tile(x, y, z):
+                self._abandon_farm_position(x, y, z, "farm soil is not level with the water source")
                 continue
             if self._is_build_position_blocked(x, y, z):
                 continue
@@ -3642,6 +4131,9 @@ class PluginInstance(Plugin):
                 if inv.get("dirt", 0) + inv.get("grass_block", 0) < 1:
                     return collect_blocks(self.agent, "dirt", 8)
                 placed = False
+                if not self._is_farm_tile_level_with_water(x, y, z):
+                    self._abandon_farm_position(x, y, z, "farm dirt placement is not level with the water source")
+                    continue
                 if not self._can_place_farm_dirt(x, y, z):
                     continue
                 try:
